@@ -85,7 +85,7 @@ func upnpService() (service, error) {
 func discover() (http.Header, error) {
 	header := http.Header{}
 	header["HOST"] = []string{"239.255.255.250:1900"}
-	header["ST"] = []string{"urn:schemas-upnp-org:device:InternetGatewayDevice:1"}
+	header["ST"] = []string{"ssdp:all"}
 	header["MAN"] = []string{"\"ssdp:discover\""}
 	header["MX"] = []string{"2"}
 	req := http.Request{
