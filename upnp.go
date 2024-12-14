@@ -61,7 +61,7 @@ func udpRequest(addr string, port int, payload []byte) ([]byte, error) {
 	return received[:n], nil
 }
 
-func UPNPService() (service, error) {
+func upnpService() (service, error) {
 	header, err := discover()
 	if err != nil {
 		return service{}, err
@@ -190,18 +190,22 @@ func serviceDescription(r root) (service, error) {
 }
 
 type envelope struct {
-	XMLName       xml.Name `xml:"s:Envelope"`
-	EncodingStyle string   `xml:"s:encodingStyle,attr"`
 	XMLNS         string   `xml:"xmlns:s,attr"`
-	Body          body     `xml:"s:Body"`
+	XMLName       xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Envelope"`
+	EncodingStyle string   `xml:"http://schemas.xmlsoap.org/soap/envelope/ encodingStyle,attr"`
+	Body          body     `xml:"http://schemas.xmlsoap.org/soap/envelope/ Body"`
 }
 type body struct {
-	XMLName           xml.Name              `xml:"s:Body"`
-	AddPortMapping    *AddPortMappingMsg    `xml:"u:AddPortMapping,omitempty"`
-	DeletePortMapping *DeletePortMappingMsg `xml:"u:DeletePortMapping,omitempty"`
+	AddPortMappingRequest       *AddPortMappingRequest       `xml:"u:AddPortMapping,omitempty"`
+	DeletePortMappingRequest    *DeletePortMappingRequest    `xml:"u:DeletePortMapping,omitempty"`
+	GetExternalIPAddressRequest *GetExternalIPAddressRequest `xml:"u:GetExternalIPAddress,omitempty"`
+
+	AddPortMappingResponse       *AddPortMappingResponse       `xml:"AddPortMappingResponse,omitempty"`
+	DeletePortMappingResponse    *DeletePortMappingResponse    `xml:"DeletePortMappingResponse,omitempty"`
+	GetExternalIPAddressResponse *GetExternalIPAddressResponse `xml:"GetExternalIPAddressResponse,omitempty"`
 }
 
-type AddPortMappingMsg struct {
+type AddPortMappingRequest struct {
 	XMLNS                     string   `xml:"xmlns:u,attr"`
 	NewRemoteHost             struct{} `xml:"NewRemoteHost"`
 	NewExternalPort           int      `xml:"NewExternalPort"`
@@ -213,11 +217,15 @@ type AddPortMappingMsg struct {
 	NewLeaseDuration          int      `xml:"NewLeaseDuration"`
 }
 
-type DeletePortMappingMsg struct {
+type DeletePortMappingRequest struct {
 	XMLNS           string   `xml:"xmlns:u,attr"`
 	NewRemoteHost   struct{} `xml:"NewRemoteHost"`
 	NewExternalPort int      `xml:"NewExternalPort"`
 	NewProtocol     string   `xml:"NewProtocol"`
+}
+
+type GetExternalIPAddressRequest struct {
+	XMLNS string `xml:"xmlns:u,attr"`
 }
 
 func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
@@ -263,34 +271,83 @@ func doRequest(req *http.Request) (envelope, error) {
 	if res.StatusCode != http.StatusOK {
 		return envelope{}, fmt.Errorf("not ok: %s: %s", res.Status, resBody)
 	}
-	return envelope{}, err
+	envelopeRes := envelope{}
+	err = xml.Unmarshal(resBody, &envelopeRes)
+	if err != nil {
+		return envelope{}, err
+	}
+	return envelopeRes, err
 }
 
-func AddPortMapping(msg AddPortMappingMsg) (envelope, error) {
+type AddPortMappingResponse struct{}
+
+func AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
 	if msg.NewInternalClient == "" {
 		msg.NewInternalClient = localIPAddr()
 	}
-	s, err := UPNPService()
+	s, err := upnpService()
 	if err != nil {
-		return envelope{}, err
+		return AddPortMappingResponse{}, err
 	}
 	msg.XMLNS = s.ServiceType
-	req, err := newEnvelopeReq("AddPortMapping", s, body{AddPortMapping: &msg})
+	req, err := newEnvelopeReq("AddPortMapping", s, body{AddPortMappingRequest: &msg})
 	if err != nil {
-		return envelope{}, err
+		return AddPortMappingResponse{}, err
 	}
-	return doRequest(req)
+	res, err := doRequest(req)
+	if err != nil {
+		return AddPortMappingResponse{}, err
+	}
+	if res.Body.AddPortMappingResponse == nil {
+		return AddPortMappingResponse{}, nil
+	}
+	return *res.Body.AddPortMappingResponse, nil
 }
 
-func DeletePortMapping(msg DeletePortMappingMsg) (envelope, error) {
-	s, err := UPNPService()
+type DeletePortMappingResponse struct{}
+
+func DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
+	s, err := upnpService()
 	if err != nil {
-		return envelope{}, err
+		return DeletePortMappingResponse{}, err
 	}
 	msg.XMLNS = s.ServiceType
-	req, err := newEnvelopeReq("DeletePortMapping", s, body{DeletePortMapping: &msg})
+	req, err := newEnvelopeReq("DeletePortMapping", s, body{DeletePortMappingRequest: &msg})
 	if err != nil {
-		return envelope{}, err
+		return DeletePortMappingResponse{}, err
 	}
-	return doRequest(req)
+	res, err := doRequest(req)
+	if err != nil {
+		return DeletePortMappingResponse{}, err
+	}
+	if res.Body.DeletePortMappingResponse == nil {
+		return DeletePortMappingResponse{}, nil
+	}
+	return *res.Body.DeletePortMappingResponse, nil
+}
+
+type GetExternalIPAddressResponse struct {
+	NewExternalIPAddress string `xml:"NewExternalIPAddress,omitempty"`
+}
+
+func GetExternalIPAddress() (GetExternalIPAddressResponse, error) {
+	s, err := upnpService()
+	if err != nil {
+		return GetExternalIPAddressResponse{}, err
+	}
+	msg := GetExternalIPAddressRequest{
+		XMLNS: s.ServiceType,
+	}
+	req, err := newEnvelopeReq("GetExternalIPAddress", s, body{GetExternalIPAddressRequest: &msg})
+	if err != nil {
+		return GetExternalIPAddressResponse{}, err
+	}
+	res, err := doRequest(req)
+	if err != nil {
+		return GetExternalIPAddressResponse{}, err
+	}
+	if res.Body.GetExternalIPAddressResponse == nil {
+		return GetExternalIPAddressResponse{}, nil
+	}
+	return *res.Body.GetExternalIPAddressResponse, nil
 }
