@@ -26,7 +26,7 @@ func httpRequest(r http.Request) []byte {
 	return b.Bytes()
 }
 
-func localIPAddr() string {
+func GetLocalIPAddr() string {
 	conn, _ := net.DialUDP("udp", nil, &net.UDPAddr{
 		IP:   []byte{6, 9, 6, 9},
 		Port: 6969,
@@ -283,7 +283,7 @@ type AddPortMappingResponse struct{}
 
 func AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
 	if msg.NewInternalClient == "" {
-		msg.NewInternalClient = localIPAddr()
+		msg.NewInternalClient = GetLocalIPAddr()
 	}
 	s, err := upnpService()
 	if err != nil {
