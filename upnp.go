@@ -36,7 +36,13 @@ func GetLocalIPAddr() string {
 	return strings.Split(conn.LocalAddr().String(), ":")[0]
 }
 func udpRequest(addr string, port int, payload []byte) ([]byte, error) {
-	socket, err := net.ListenUDP("udp", nil)
+	localIp, err := netip.ParseAddr(GetLocalIPAddr())
+	if err != nil {
+		return nil, err
+	}
+	socket, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP: localIp.AsSlice(),
+	})
 	if err != nil {
 		return nil, err
 	}
