@@ -105,7 +105,7 @@ func discover() (http.Header, error) {
 	header["HOST"] = []string{"239.255.255.250:1900"}
 	header["ST"] = []string{"ssdp:all"}
 	header["MAN"] = []string{"\"ssdp:discover\""}
-	header["MX"] = []string{"2"}
+	header["MX"] = []string{"5"}
 	req := http.Request{
 		Method: "M-SEARCH",
 		Header: header,
