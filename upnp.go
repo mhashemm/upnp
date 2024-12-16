@@ -4,16 +4,34 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/textproto"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const (
+	addPortMapping       = "AddPortMapping"
+	deletePortMapping    = "DeletePortMapping"
+	getExternalIPAddress = "GetExternalIPAddress"
+)
+
+var requiredActionNames = []string{addPortMapping, deletePortMapping, getExternalIPAddress}
+
+func joinPath(parts ...string) string {
+	for i := range parts {
+		parts[i] = strings.Trim(parts[i], "/")
+	}
+	return strings.Join(parts, "/")
+}
 
 func httpRequest(r http.Request) []byte {
 	b := bytes.NewBuffer(nil)
@@ -66,19 +84,19 @@ func upnpService() (service, error) {
 	if err != nil {
 		return service{}, err
 	}
+	locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
+	if len(locationN) < 3 {
+		return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
+	}
+	location := strings.Join(locationN[:3], "/")
 	dd, err := deviceDescription(header)
 	if err != nil {
 		return service{}, err
 	}
-	s, err := serviceDescription(dd)
-	if err != nil {
-		return service{}, err
+	s, found := getConnectionService(location, dd.Device)
+	if !found {
+		return service{}, errors.New("not found")
 	}
-	locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
-	if len(locationN) < 3 {
-		return s, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
-	}
-	s.Location = strings.Join(locationN[:3], "/")
 	return s, nil
 }
 
@@ -146,6 +164,22 @@ type root struct {
 	Device      device      `xml:"device"`
 }
 
+type argument struct {
+	XMLName              xml.Name `xml:"argument"`
+	Name                 string   `xml:"name"`
+	Direction            string   `xml:"direction"`
+	RelatedStateVariable string   `xml:"relatedStateVariable"`
+}
+type action struct {
+	XMLName      xml.Name   `xml:"action"`
+	Name         string     `xml:"name"`
+	ArgumentList []argument `xml:"argumentList>argument"`
+}
+type description struct {
+	XMLName    xml.Name `xml:"scpd"`
+	ActionList []action `xml:"actionList>action"`
+}
+
 func deviceDescription(header http.Header) (root, error) {
 	r := root{}
 	res, err := http.Get(header.Get("location"))
@@ -163,30 +197,53 @@ func deviceDescription(header http.Header) (root, error) {
 	xml.Unmarshal(body, &r)
 	return r, nil
 }
-func getConnectionDevice(rootDevice device) (device, bool) {
-	if len(rootDevice.DeviceList) == 0 {
-		return rootDevice, false
+func isValidService(s service) bool {
+	url := joinPath(s.Location, s.SCPDURL)
+	res, err := http.Get(url)
+	if err != nil {
+		log.Println(url, err)
+		return false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		log.Println(url, res.Status)
+		return false
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Println(url, err)
+		return false
+	}
+
+	desc := description{}
+	err = xml.Unmarshal(body, &desc)
+	if err != nil {
+		fmt.Println(url, string(body), err)
+		return false
+	}
+
+	for _, a := range desc.ActionList {
+		if slices.Contains(requiredActionNames, a.Name) {
+			return true
+		}
+	}
+
+	return false
+}
+func getConnectionService(location string, rootDevice device) (service, bool) {
+	for _, s := range rootDevice.ServiceList {
+		s.Location = location
+		if isValidService(s) {
+			return s, true
+		}
 	}
 	for _, d := range rootDevice.DeviceList {
-		if strings.Contains(d.DeviceType, "ConnectionDevice") {
-			return d, true
-		}
-		d, found := getConnectionDevice(d)
-		if found {
-			return d, true
+		s, ok := getConnectionService(location, d)
+		if ok {
+			return s, true
 		}
 	}
-	return device{}, false
-}
-func serviceDescription(r root) (service, error) {
-	d, found := getConnectionDevice(r.Device)
-	if !found {
-		return service{}, fmt.Errorf("no connection device found: %v", r)
-	}
-	if len(d.ServiceList) == 0 {
-		return service{}, fmt.Errorf("no services found: %v", d)
-	}
-	return d.ServiceList[0], nil
+	return service{}, false
 }
 
 type envelope struct {
@@ -229,6 +286,7 @@ type GetExternalIPAddressRequest struct {
 }
 
 func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
+	url := joinPath(s.Location, s.ControlURL)
 	e := envelope{
 		EncodingStyle: "http://schemas.xmlsoap.org/soap/encoding/",
 		XMLNS:         "http://schemas.xmlsoap.org/soap/envelope/",
@@ -241,8 +299,7 @@ func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
 	buf := bytes.NewBuffer(make([]byte, 0, len(xml.Header)+len(body)))
 	buf.WriteString(xml.Header)
 	buf.Write(body)
-
-	req, err := http.NewRequest(http.MethodPost, s.Location+s.ControlURL, buf)
+	req, err := http.NewRequest(http.MethodPost, url, buf)
 
 	if err != nil {
 		return nil, err
@@ -286,7 +343,7 @@ func AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
 		return AddPortMappingResponse{}, err
 	}
 	msg.XMLNS = s.ServiceType
-	req, err := newEnvelopeReq("AddPortMapping", s, body{AddPortMappingRequest: &msg})
+	req, err := newEnvelopeReq(addPortMapping, s, body{AddPortMappingRequest: &msg})
 	if err != nil {
 		return AddPortMappingResponse{}, err
 	}
@@ -308,7 +365,7 @@ func DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse,
 		return DeletePortMappingResponse{}, err
 	}
 	msg.XMLNS = s.ServiceType
-	req, err := newEnvelopeReq("DeletePortMapping", s, body{DeletePortMappingRequest: &msg})
+	req, err := newEnvelopeReq(deletePortMapping, s, body{DeletePortMappingRequest: &msg})
 	if err != nil {
 		return DeletePortMappingResponse{}, err
 	}
@@ -334,7 +391,7 @@ func GetExternalIPAddress() (GetExternalIPAddressResponse, error) {
 	msg := GetExternalIPAddressRequest{
 		XMLNS: s.ServiceType,
 	}
-	req, err := newEnvelopeReq("GetExternalIPAddress", s, body{GetExternalIPAddressRequest: &msg})
+	req, err := newEnvelopeReq(getExternalIPAddress, s, body{GetExternalIPAddressRequest: &msg})
 	if err != nil {
 		return GetExternalIPAddressResponse{}, err
 	}
