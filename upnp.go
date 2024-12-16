@@ -238,9 +238,8 @@ func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	buf := bytes.NewBuffer(nil)
-	buf.Grow(len(xml.Header) + len(body))
-	buf.Write([]byte(xml.Header))
+	buf := bytes.NewBuffer(make([]byte, 0, len(xml.Header)+len(body)))
+	buf.WriteString(xml.Header)
 	buf.Write(body)
 
 	req, err := http.NewRequest(http.MethodPost, s.Location+s.ControlURL, buf)
@@ -250,10 +249,7 @@ func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
 	}
 
 	req.Header["SOAPAction"] = []string{fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)}
-	req.Header["Content-Type"] = []string{"text/xml"}
-	req.Header["Connection"] = []string{"Close"}
-	req.Header["Cache-Control"] = []string{"no-cache"}
-	req.Header["Pragma"] = []string{"no-cache"}
+	req.Header["Content-Type"] = []string{"text/xml; charset=utf-8"}
 	return req, nil
 }
 
