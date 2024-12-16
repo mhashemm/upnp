@@ -88,6 +88,7 @@ func discover() (http.Header, error) {
 	header["ST"] = []string{"ssdp:all"}
 	header["MAN"] = []string{"\"ssdp:discover\""}
 	header["MX"] = []string{"2"}
+	header["USER-AGENT"] = []string{"Golang/1 UPnP/1.1 Foo/1.0"}
 	req := http.Request{
 		Method: "M-SEARCH",
 		Header: header,
