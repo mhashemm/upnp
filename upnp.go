@@ -34,6 +34,7 @@ func joinPath(parts ...string) string {
 }
 
 func httpRequest(r http.Request) []byte {
+	r.Header["USER-AGENT"] = []string{"Golang/1.23.3 UPnP/1.1 Upnp/1.0"}
 	b := bytes.NewBuffer(nil)
 	b.WriteString(r.Method)
 	b.WriteString(" * HTTP/1.1\r\n")
