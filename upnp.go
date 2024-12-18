@@ -34,6 +34,7 @@ func joinPath(parts ...string) string {
 }
 
 func httpRequest(r http.Request) []byte {
+	r.Header["USER-AGENT"] = []string{"Golang/1.23.3 UPnP/1.1 Upnp/1.0"}
 	b := bytes.NewBuffer(nil)
 	b.WriteString(r.Method)
 	b.WriteString(" * HTTP/1.1\r\n")
@@ -93,16 +94,18 @@ func upnpService() (service, error) {
 		return service{}, err
 	}
 	for _, header := range headers {
-		locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
-		if len(locationN) < 3 {
-			return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
-		}
-		location := strings.Join(locationN[:3], "/")
 		dd, err := deviceDescription(header)
 		if err != nil {
 			return service{}, err
 		}
-		s, found := getConnectionService(location, dd.Device)
+		if dd.BaseUrl == "" {
+			locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
+			if len(locationN) < 3 {
+				return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
+			}
+			dd.BaseUrl = strings.Join(locationN[:3], "/")
+		}
+		s, found := getConnectionService(dd.BaseUrl, dd.Device)
 		if found {
 			return s, nil
 		}
@@ -176,6 +179,7 @@ type root struct {
 	XMLNS       string      `xml:"xmlns,attr"`
 	SpecVersion specVersion `xml:"specVersion"`
 	Device      device      `xml:"device"`
+	BaseUrl     string      `xml:"URLBase"`
 }
 
 type argument struct {
