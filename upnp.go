@@ -53,7 +53,7 @@ func GetLocalIPAddr() string {
 	defer conn.Close()
 	return strings.Split(conn.LocalAddr().String(), ":")[0]
 }
-func udpRequest(addr string, port int, payload []byte) ([]byte, error) {
+func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
 	socket, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
@@ -71,36 +71,46 @@ func udpRequest(addr string, port int, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	received := make([]byte, 4096)
-	n, err := socket.Read(received)
-	if err != nil {
-		return nil, err
+	res := [][]byte{}
+	for {
+		received := make([]byte, 4096)
+		socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := socket.Read(received)
+		if err != nil {
+			break
+		}
+		res = append(res, received[:n])
 	}
-	return received[:n], nil
+	if len(res) == 0 {
+		return nil, errors.New("no devices found")
+	}
+	return res, nil
 }
 
 func upnpService() (service, error) {
-	header, err := discover()
+	headers, err := discover()
 	if err != nil {
 		return service{}, err
 	}
-	locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
-	if len(locationN) < 3 {
-		return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
+	for _, header := range headers {
+		locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
+		if len(locationN) < 3 {
+			return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
+		}
+		location := strings.Join(locationN[:3], "/")
+		dd, err := deviceDescription(header)
+		if err != nil {
+			return service{}, err
+		}
+		s, found := getConnectionService(location, dd.Device)
+		if found {
+			return s, nil
+		}
 	}
-	location := strings.Join(locationN[:3], "/")
-	dd, err := deviceDescription(header)
-	if err != nil {
-		return service{}, err
-	}
-	s, found := getConnectionService(location, dd.Device)
-	if !found {
-		return service{}, errors.New("not found")
-	}
-	return s, nil
+	return service{}, errors.New("not found")
 }
 
-func discover() (http.Header, error) {
+func discover() ([]http.Header, error) {
 	header := http.Header{}
 	header["HOST"] = []string{"239.255.255.250:1900"}
 	header["ST"] = []string{"ssdp:all"}
@@ -110,28 +120,32 @@ func discover() (http.Header, error) {
 		Method: "M-SEARCH",
 		Header: header,
 	}
-	res, err := udpRequest("239.255.255.250", 1900, httpRequest(req))
+	headers := []http.Header{}
+	devices, err := udpRequest("239.255.255.250", 1900, httpRequest(req))
 	if err != nil {
 		return nil, err
 	}
-	httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
-	if !found {
-		return nil, fmt.Errorf("invalid response: %s", res)
+	for _, res := range devices {
+		httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
+		if !found {
+			return nil, fmt.Errorf("invalid response: %s", res)
+		}
+		s := bytes.Split(httpRes, []byte{' '})
+		if len(s) < 3 {
+			return nil, fmt.Errorf("invalid response: %s", headerRes)
+		}
+		statusCode := string(s[1])
+		if statusCode != strconv.Itoa(http.StatusOK) {
+			return nil, fmt.Errorf("not ok: %s", httpRes)
+		}
+		_header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerRes))).ReadMIMEHeader()
+		if err != nil {
+			return nil, err
+		}
+		header := http.Header(_header)
+		headers = append(headers, header)
 	}
-	s := bytes.Split(httpRes, []byte{' '})
-	if len(s) < 3 {
-		return nil, fmt.Errorf("invalid response: %s", headerRes)
-	}
-	statusCode := string(s[1])
-	if statusCode != strconv.Itoa(http.StatusOK) {
-		return nil, fmt.Errorf("not ok: %s", httpRes)
-	}
-	_header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerRes))).ReadMIMEHeader()
-	if err != nil {
-		return nil, err
-	}
-	header = http.Header(_header)
-	return header, nil
+	return headers, nil
 }
 
 type specVersion struct {
