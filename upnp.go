@@ -81,6 +81,7 @@ func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
 			break
 		}
 		res = append(res, received[:n])
+		fmt.Println(string(received[:n]))
 	}
 	if len(res) == 0 {
 		return nil, errors.New("no devices found")
