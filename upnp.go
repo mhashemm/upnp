@@ -96,12 +96,14 @@ func upnpService() (service, error) {
 	for _, header := range headers {
 		dd, err := deviceDescription(header)
 		if err != nil {
-			return service{}, err
+			log.Println(err)
+			continue
 		}
 		if dd.BaseUrl == "" {
 			locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
 			if len(locationN) < 3 {
-				return service{}, fmt.Errorf("invalid location: %s", header.Get("LOCATION"))
+				log.Printf("invalid location: %s\n", header.Get("LOCATION"))
+				continue
 			}
 			dd.BaseUrl = strings.Join(locationN[:3], "/")
 		}
@@ -110,7 +112,7 @@ func upnpService() (service, error) {
 			return s, nil
 		}
 	}
-	return service{}, errors.New("not found")
+	return service{}, errors.New("no devices found")
 }
 
 func discover() ([]http.Header, error) {
@@ -131,19 +133,23 @@ func discover() ([]http.Header, error) {
 	for _, res := range devices {
 		httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
 		if !found {
-			return nil, fmt.Errorf("invalid response: %s", res)
+			log.Printf("invalid response: %s\n", res)
+			continue
 		}
 		s := bytes.Split(httpRes, []byte{' '})
 		if len(s) < 3 {
-			return nil, fmt.Errorf("invalid response: %s", headerRes)
+			log.Printf("invalid response: %s\n", headerRes)
+			continue
 		}
 		statusCode := string(s[1])
 		if statusCode != strconv.Itoa(http.StatusOK) {
-			return nil, fmt.Errorf("not ok: %s", httpRes)
+			log.Printf("not ok: %s\n", httpRes)
+			continue
 		}
 		_header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerRes))).ReadMIMEHeader()
 		if err != nil {
-			return nil, err
+			log.Println(err)
+			continue
 		}
 		header := http.Header(_header)
 		headers = append(headers, header)
