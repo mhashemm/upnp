@@ -36,7 +36,6 @@ func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
 	localip, _ := netip.ParseAddr(local)
 	socket, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   localip.AsSlice(),
-		Port: 1900,
 	})
 	if err != nil {
 		return nil, err
