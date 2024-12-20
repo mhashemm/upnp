@@ -32,7 +32,10 @@ func httpRequest(r http.Request) []byte {
 }
 
 func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
-	socket, err := net.ListenUDP("udp", nil)
+	socket, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP:   net.IP{0, 0, 0, 0},
+		Port: 1900,
+	})
 	if err != nil {
 		return nil, err
 	}
