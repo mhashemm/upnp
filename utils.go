@@ -31,17 +31,20 @@ func httpRequest(r http.Request) []byte {
 	return b.Bytes()
 }
 
-func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
-	local := GetLocalIPAddr()
-	localip, _ := netip.ParseAddr(local)
+func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, error) {
+	local, err := netip.ParseAddr(localIP)
+	if err != nil {
+		return nil, err
+	}
 	socket, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   localip.AsSlice(),
+		IP: local.AsSlice(),
 	})
 	if err != nil {
 		return nil, err
 	}
 	defer socket.Close()
-	ip, err := netip.ParseAddr(addr)
+
+	ip, err := netip.ParseAddr(remoteIP)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +73,7 @@ func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
 		res = append(res, received[:n])
 	}
 	if len(res) == 0 {
-		return nil, fmt.Errorf("%s:%d no content, with error: %s", addr, port, resErr)
+		return nil, fmt.Errorf("%s:%d no content, with error: %s", remoteIP, port, resErr)
 	}
 	return res, nil
 }
