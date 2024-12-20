@@ -60,7 +60,7 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 	var resErr error
 	for {
 		received := make([]byte, 4096)
-		err := socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		err := socket.SetReadDeadline(time.Now().Add(10 * time.Second))
 		if err != nil {
 			resErr = err
 			break
@@ -71,6 +71,7 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 			break
 		}
 		res = append(res, received[:n])
+		fmt.Println(string(received[:n]))
 	}
 	if len(res) == 0 {
 		return nil, fmt.Errorf("%s:%d no content, with error: %s", remoteIP, port, resErr)
