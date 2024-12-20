@@ -53,7 +53,11 @@ func udpRequest(addr string, port int, payload []byte) ([][]byte, error) {
 	var resErr error
 	for {
 		received := make([]byte, 4096)
-		socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		err := socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			resErr = err
+			break
+		}
 		n, err := socket.Read(received)
 		if err != nil {
 			resErr = err
