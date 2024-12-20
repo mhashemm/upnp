@@ -18,7 +18,11 @@ import (
 
 func New() (*Client, error) {
 	localIP := GetLocalIPAddr()
-	service, err := upnpService()
+	headers, err := discover(localIP)
+	if err != nil {
+		return nil, err
+	}
+	service, err := upnpService(headers)
 	if err != nil {
 		return nil, err
 	}
@@ -38,11 +42,7 @@ func GetLocalIPAddr() string {
 	return strings.Split(conn.LocalAddr().String(), ":")[0]
 }
 
-func upnpService() (service, error) {
-	headers, err := discover()
-	if err != nil {
-		return service{}, err
-	}
+func upnpService(headers []http.Header) (service, error) {
 	errs := []error{}
 	for _, header := range headers {
 		dd, err := deviceDescription(header)
@@ -67,7 +67,7 @@ func upnpService() (service, error) {
 	return service{}, errors.Join(errs...)
 }
 
-func discover() ([]http.Header, error) {
+func discover(localIP string) ([]http.Header, error) {
 	header := http.Header{}
 	header["HOST"] = []string{"239.255.255.250:1900"}
 	header["ST"] = []string{"ssdp:all"}
@@ -78,7 +78,7 @@ func discover() ([]http.Header, error) {
 		Header: header,
 	}
 	headers := []http.Header{}
-	devices, err := udpRequest("239.255.255.250", 1900, httpRequest(req))
+	devices, err := udpRequest(localIP, "239.255.255.250", 1900, httpRequest(req))
 	if err != nil {
 		return nil, err
 	}
