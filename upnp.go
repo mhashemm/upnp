@@ -3,7 +3,6 @@ package upnp
 import (
 	"bufio"
 	"bytes"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -12,15 +11,17 @@ import (
 	"net/textproto"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 )
 
 func New() (*Client, error) {
 	localIP := GetLocalIPAddr()
+	if localIP == "" {
+		return nil, errors.New("no outbound route: cannot determine local ip")
+	}
 	headers, err := discover(localIP)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no ssdp reply on %s (a vpn or virtual interface can route the multicast away from your lan): %w", localIP, err)
 	}
 	service, err := upnpService(headers)
 	if err != nil {
@@ -33,38 +34,58 @@ func New() (*Client, error) {
 }
 
 func GetLocalIPAddr() string {
-	conn, _ := net.DialUDP("udp", nil, &net.UDPAddr{
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
 		IP:   []byte{6, 9, 6, 9},
 		Port: 6969,
 	})
-	conn.SetDeadline(time.Unix(0, 0))
+	if err != nil {
+		return ""
+	}
 	defer conn.Close()
-	return strings.Split(conn.LocalAddr().String(), ":")[0]
+	conn.SetDeadline(time.Unix(0, 0))
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
 func upnpService(headers []http.Header) (service, error) {
 	errs := []error{}
+	all := []service{}
 	for _, header := range headers {
 		dd, err := deviceDescription(header)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if dd.BaseUrl == "" {
-			locationN := strings.SplitN(header.Get("LOCATION"), "/", 4)
-			if len(locationN) < 3 {
-				errs = append(errs, fmt.Errorf("invalid location: %s\n", header.Get("LOCATION")))
-				continue
-			}
-			dd.BaseUrl = strings.Join(locationN[:3], "/")
+		base := dd.BaseUrl
+		if base == "" {
+			base = header.Get("LOCATION")
 		}
-		s, err := getConnectionService(dd.BaseUrl, dd.Device)
-		if err == nil {
+		candidates, err := getConnectionService(base, dd.Device)
+		if len(candidates) == 0 {
+			errs = append(errs, err)
+			continue
+		}
+		if s, ok := connectedService(candidates); ok {
 			return s, nil
 		}
-		errs = append(errs, err)
+		all = append(all, candidates...)
+	}
+	if len(all) > 0 {
+		return all[0], nil
 	}
 	return service{}, errors.Join(errs...)
+}
+
+func connectedService(candidates []service) (service, bool) {
+	for _, s := range candidates {
+		res, err := (&Client{service: s}).GetExternalIPAddress()
+		if err != nil {
+			continue
+		}
+		if ip := res.NewExternalIPAddress; ip != "" && ip != "0.0.0.0" {
+			return s, true
+		}
+	}
+	return service{}, false
 }
 
 func discover(localIP string) ([]http.Header, error) {
@@ -72,17 +93,22 @@ func discover(localIP string) ([]http.Header, error) {
 	header["HOST"] = []string{"239.255.255.250:1900"}
 	header["ST"] = []string{"ssdp:all"}
 	header["MAN"] = []string{"\"ssdp:discover\""}
-	header["MX"] = []string{"5"}
+	header["MX"] = []string{strconv.Itoa(int(ssdpMX / time.Second))}
 	req := http.Request{
 		Method: "M-SEARCH",
 		Header: header,
 	}
-	headers := []http.Header{}
 	devices, err := udpRequest(localIP, "239.255.255.250", 1900, httpRequest(req))
 	if err != nil {
 		return nil, err
 	}
+	return parseSSDP(devices)
+}
+
+func parseSSDP(devices [][]byte) ([]http.Header, error) {
+	headers := []http.Header{}
 	errs := []error{}
+	seen := map[string]bool{}
 	for _, res := range devices {
 		httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
 		if !found {
@@ -105,6 +131,11 @@ func discover(localIP string) ([]http.Header, error) {
 			continue
 		}
 		header := http.Header(_header)
+		location := header.Get("LOCATION")
+		if seen[location] {
+			continue
+		}
+		seen[location] = true
 		headers = append(headers, header)
 	}
 	if len(headers) == 0 {
@@ -115,69 +146,79 @@ func discover(localIP string) ([]http.Header, error) {
 
 func deviceDescription(header http.Header) (root, error) {
 	r := root{}
-	res, err := http.Get(header.Get("location"))
+	location := header.Get("LOCATION")
+	res, err := httpClient.Get(location)
 	if err != nil {
 		return r, err
-	}
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return r, err
-	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return r, fmt.Errorf("%s: %s", res.Status, body)
-	}
-	xml.Unmarshal(body, &r)
-	return r, nil
-}
-
-func isValidService(s service) error {
-	url := joinPath(s.Location, s.SCPDURL)
-	res, err := http.Get(url)
-	if err != nil {
-		return err
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return err
+		return r, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s responed with status=%d body=[%s]", url, res.StatusCode, body)
+		return r, fmt.Errorf("%s: %s", res.Status, body)
 	}
-	desc := description{}
-	err = xml.Unmarshal(body, &desc)
-	if err != nil {
-		return err
+	if err := decodeXML(body, &r); err != nil && len(r.Device.ServiceList) == 0 && len(r.Device.DeviceList) == 0 {
+		return r, fmt.Errorf("%s: %w", location, err)
 	}
-
-	for _, a := range desc.ActionList {
-		if slices.Contains([]string{addPortMapping, deletePortMapping, getExternalIPAddress}, a.Name) {
-			return nil
-		}
-	}
-
-	return fmt.Errorf("%s service is not valid", url)
+	return r, nil
 }
 
-func getConnectionService(location string, rootDevice device) (service, error) {
+func serviceActions(s service) ([]string, error) {
+	url, err := resolveURL(s.Location, s.SCPDURL)
+	if err != nil {
+		return nil, err
+	}
+	res, err := httpClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s responed with status=%d body=[%s]", url, res.StatusCode, body)
+	}
+	desc := description{}
+	if err := decodeXML(body, &desc); err != nil && len(desc.ActionList) == 0 {
+		return nil, err
+	}
+
+	actions := []string{}
+	for _, a := range desc.ActionList {
+		if slices.Contains(supported, a.Name) {
+			actions = append(actions, a.Name)
+		}
+	}
+	if len(actions) == 0 {
+		return nil, fmt.Errorf("%s service is not valid", url)
+	}
+	return actions, nil
+}
+
+func getConnectionService(location string, rootDevice device) ([]service, error) {
+	services := []service{}
 	errs := []error{}
 	for _, s := range rootDevice.ServiceList {
 		s.Location = location
-		err := isValidService(s)
-		if err == nil {
-			return s, nil
+		actions, err := serviceActions(s)
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
-		errs = append(errs, err)
+		s.Actions = actions
+		services = append(services, s)
 	}
 	for _, d := range rootDevice.DeviceList {
 		s, err := getConnectionService(location, d)
-		if err == nil {
-			return s, nil
-		}
+		services = append(services, s...)
 		errs = append(errs, err)
 	}
-	return service{}, errors.Join(errs...)
+	slices.SortStableFunc(services, func(a, b service) int { return len(b.Actions) - len(a.Actions) })
+	return services, errors.Join(errs...)
 }
 
 func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
@@ -185,11 +226,16 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 		msg.NewInternalClient = c.LocalIP
 	}
 	msg.XMLNS = c.service.ServiceType
-	req, err := newEnvelopeReq(addPortMapping, c.service, body{AddPortMappingRequest: &msg})
+	req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
 	if err != nil {
 		return AddPortMappingResponse{}, err
 	}
-	res, err := doRequest(req)
+	res, err := doRequest(addPortMapping, req)
+	var upnpErr *Error
+	if errors.As(err, &upnpErr) && upnpErr.Code == ErrOnlyPermanentLease && msg.NewLeaseDuration != 0 {
+		msg.NewLeaseDuration = 0
+		return c.AddPortMapping(msg)
+	}
 	if err != nil {
 		return AddPortMappingResponse{}, err
 	}
@@ -201,11 +247,11 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 
 func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
 	msg.XMLNS = c.service.ServiceType
-	req, err := newEnvelopeReq(deletePortMapping, c.service, body{DeletePortMappingRequest: &msg})
+	req, err := newEnvelopeReq(deletePortMapping, c.service, &msg)
 	if err != nil {
 		return DeletePortMappingResponse{}, err
 	}
-	res, err := doRequest(req)
+	res, err := doRequest(deletePortMapping, req)
 	if err != nil {
 		return DeletePortMappingResponse{}, err
 	}
@@ -219,11 +265,11 @@ func (c *Client) GetExternalIPAddress() (GetExternalIPAddressResponse, error) {
 	msg := GetExternalIPAddressRequest{
 		XMLNS: c.service.ServiceType,
 	}
-	req, err := newEnvelopeReq(getExternalIPAddress, c.service, body{GetExternalIPAddressRequest: &msg})
+	req, err := newEnvelopeReq(getExternalIPAddress, c.service, &msg)
 	if err != nil {
 		return GetExternalIPAddressResponse{}, err
 	}
-	res, err := doRequest(req)
+	res, err := doRequest(getExternalIPAddress, req)
 	if err != nil {
 		return GetExternalIPAddressResponse{}, err
 	}

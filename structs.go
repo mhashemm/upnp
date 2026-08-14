@@ -1,12 +1,18 @@
 package upnp
 
-import "encoding/xml"
+import (
+	"encoding/xml"
+	"fmt"
+	"strings"
+)
 
 const (
 	addPortMapping       = "AddPortMapping"
 	deletePortMapping    = "DeletePortMapping"
 	getExternalIPAddress = "GetExternalIPAddress"
 )
+
+var supported = []string{addPortMapping, deletePortMapping, getExternalIPAddress}
 
 type Client struct {
 	LocalIP string
@@ -26,6 +32,7 @@ type service struct {
 	EventSubURL string   `xml:"eventSubURL"`
 	SCPDURL     string   `xml:"SCPDURL"`
 	Location    string   `xml:"-"`
+	Actions     []string `xml:"-"`
 }
 type device struct {
 	XMLName      xml.Name  `xml:"device"`
@@ -66,17 +73,38 @@ type envelope struct {
 	EncodingStyle string   `xml:"http://schemas.xmlsoap.org/soap/envelope/ encodingStyle,attr"`
 	Body          body     `xml:"http://schemas.xmlsoap.org/soap/envelope/ Body"`
 }
+
 type body struct {
-	AddPortMappingRequest       *AddPortMappingRequest       `xml:"u:AddPortMapping,omitempty"`
-	DeletePortMappingRequest    *DeletePortMappingRequest    `xml:"u:DeletePortMapping,omitempty"`
-	GetExternalIPAddressRequest *GetExternalIPAddressRequest `xml:"u:GetExternalIPAddress,omitempty"`
+	Fault *fault `xml:"Fault,omitempty"`
 
 	AddPortMappingResponse       *AddPortMappingResponse       `xml:"AddPortMappingResponse,omitempty"`
 	DeletePortMappingResponse    *DeletePortMappingResponse    `xml:"DeletePortMappingResponse,omitempty"`
 	GetExternalIPAddressResponse *GetExternalIPAddressResponse `xml:"GetExternalIPAddressResponse,omitempty"`
 }
 
+type fault struct {
+	Code        int    `xml:"detail>UPnPError>errorCode"`
+	Description string `xml:"detail>UPnPError>errorDescription"`
+}
+
+const (
+	ErrNoSuchEntryInArray     = 714
+	ErrConflictInMappingEntry = 718
+	ErrOnlyPermanentLease     = 725
+)
+
+type Error struct {
+	Action      string
+	Code        int
+	Description string
+}
+
+func (e *Error) Error() string {
+	return strings.TrimRight(fmt.Sprintf("%s: upnp error %d: %s", e.Action, e.Code, e.Description), ": ")
+}
+
 type AddPortMappingRequest struct {
+	XMLName                   xml.Name `xml:"u:AddPortMapping"`
 	XMLNS                     string   `xml:"xmlns:u,attr"`
 	NewRemoteHost             struct{} `xml:"NewRemoteHost"`
 	NewExternalPort           int      `xml:"NewExternalPort"`
@@ -89,6 +117,7 @@ type AddPortMappingRequest struct {
 }
 
 type DeletePortMappingRequest struct {
+	XMLName         xml.Name `xml:"u:DeletePortMapping"`
 	XMLNS           string   `xml:"xmlns:u,attr"`
 	NewRemoteHost   struct{} `xml:"NewRemoteHost"`
 	NewExternalPort int      `xml:"NewExternalPort"`
@@ -96,7 +125,8 @@ type DeletePortMappingRequest struct {
 }
 
 type GetExternalIPAddressRequest struct {
-	XMLNS string `xml:"xmlns:u,attr"`
+	XMLName xml.Name `xml:"u:GetExternalIPAddress"`
+	XMLNS   string   `xml:"xmlns:u,attr"`
 }
 
 type AddPortMappingResponse struct{}

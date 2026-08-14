@@ -8,15 +8,38 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 )
 
-func joinPath(parts ...string) string {
-	for i := range parts {
-		parts[i] = strings.Trim(parts[i], "/")
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+const (
+	ssdpMX       = 5 * time.Second
+	ssdpRetries  = 2
+	ssdpRetryGap = 500 * time.Millisecond
+	ssdpMargin   = 500 * time.Millisecond
+)
+
+func decodeXML(b []byte, v any) error {
+	d := xml.NewDecoder(bytes.NewReader(b))
+	d.Strict = false
+	d.Entity = xml.HTMLEntity
+	d.AutoClose = xml.HTMLAutoClose
+	return d.Decode(v)
+}
+
+func resolveURL(base, ref string) (string, error) {
+	b, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("invalid base url %q: %w", base, err)
 	}
-	return strings.Join(parts, "/")
+	r, err := url.Parse(ref)
+	if err != nil {
+		return "", fmt.Errorf("invalid url %q: %w", ref, err)
+	}
+	return b.ResolveReference(r).String(), nil
 }
 
 func httpRequest(r http.Request) []byte {
@@ -56,11 +79,18 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 	if err != nil {
 		return nil, err
 	}
+	go func() {
+		for range ssdpRetries {
+			time.Sleep(ssdpRetryGap)
+			socket.WriteToUDP(payload, remote)
+		}
+	}()
+	deadline := time.Now().Add(ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin)
 	res := [][]byte{}
 	var resErr error
 	for {
 		received := make([]byte, 4096)
-		err := socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		err := socket.SetReadDeadline(deadline)
 		if err != nil {
 			resErr = err
 			break
@@ -78,22 +108,25 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 	return res, nil
 }
 
-func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
-	url := joinPath(s.Location, s.ControlURL)
-	e := envelope{
-		EncodingStyle: "http://schemas.xmlsoap.org/soap/encoding/",
-		XMLNS:         "http://schemas.xmlsoap.org/soap/envelope/",
-		Body:          b,
-	}
-	body, err := xml.Marshal(e)
+const (
+	envelopeOpen  = xml.Header + `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>`
+	envelopeClose = `</s:Body></s:Envelope>`
+)
+
+func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
+	url, err := resolveURL(s.Location, s.ControlURL)
 	if err != nil {
 		return nil, err
 	}
-	buf := bytes.NewBuffer(make([]byte, 0, len(xml.Header)+len(body)))
-	buf.WriteString(xml.Header)
+	body, err := xml.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, len(envelopeOpen)+len(body)+len(envelopeClose)))
+	buf.WriteString(envelopeOpen)
 	buf.Write(body)
+	buf.WriteString(envelopeClose)
 	req, err := http.NewRequest(http.MethodPost, url, buf)
-
 	if err != nil {
 		return nil, err
 	}
@@ -103,9 +136,8 @@ func newEnvelopeReq(action string, s service, b body) (*http.Request, error) {
 	return req, nil
 }
 
-func doRequest(req *http.Request) (envelope, error) {
-	client := http.DefaultClient
-	res, err := client.Do(req)
+func doRequest(action string, req *http.Request) (envelope, error) {
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return envelope{}, err
 	}
@@ -114,13 +146,17 @@ func doRequest(req *http.Request) (envelope, error) {
 	if err != nil {
 		return envelope{}, err
 	}
-	if res.StatusCode != http.StatusOK {
-		return envelope{}, fmt.Errorf("not ok: %s: %s", res.Status, resBody)
-	}
 	envelopeRes := envelope{}
-	err = xml.Unmarshal(resBody, &envelopeRes)
-	if err != nil {
-		return envelope{}, err
+	unmarshalErr := xml.Unmarshal(resBody, &envelopeRes)
+	if res.StatusCode != http.StatusOK {
+		if unmarshalErr == nil && envelopeRes.Body.Fault != nil {
+			f := envelopeRes.Body.Fault
+			return envelope{}, &Error{Action: action, Code: f.Code, Description: f.Description}
+		}
+		return envelope{}, fmt.Errorf("%s: not ok: %s: %s", action, res.Status, resBody)
 	}
-	return envelopeRes, err
+	if unmarshalErr != nil {
+		return envelope{}, unmarshalErr
+	}
+	return envelopeRes, nil
 }
