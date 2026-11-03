@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -56,7 +58,8 @@ func fakeRouter(t *testing.T, svcs ...fakeSvc) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	desc := `<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>` +
-		`<deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType><serviceList>`
+		`<deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>` +
+		`<manufacturer>Acme</manufacturer><modelName>R1</modelName><serviceList>`
 	for i, s := range svcs {
 		id := fmt.Sprint(i)
 		desc += `<service><serviceType>` + s.typ + `</serviceType>` +
@@ -148,21 +151,30 @@ func ssdpOK(location string) []byte {
 
 func ssdpST(location, st string) []byte {
 	return []byte("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: " + location +
-		"\r\nST: " + st + "\r\nUSN: uuid:1::" + st + "\r\n\r\n")
+		"\r\nSERVER: Linux UPnP/1.1 fake/1.0\r\nST: " + st + "\r\nUSN: uuid:1::" + st + "\r\n\r\n")
+}
+
+func datagrams(from string, payloads ...[]byte) []datagram {
+	ds := []datagram{}
+	for _, p := range payloads {
+		ds = append(ds, datagram{from: netip.MustParseAddrPort(from), data: p})
+	}
+	return ds
 }
 
 // One device answers ssdp:all once per service, and the M-SEARCH goes out three
 // times on top of that, so without dedupe a single router gets its description
-// fetched a dozen times.
+// fetched a dozen times. A reply without LOCATION names nothing to fetch.
 func TestParseSSDP(t *testing.T) {
-	got, err := parseSSDP([][]byte{
+	got, err := parseSSDP(datagrams("10.0.0.1:1900",
 		ssdpOK("http://10.0.0.1:80/desc.xml"),
 		ssdpOK("http://10.0.0.1:80/desc.xml"),
 		ssdpOK("http://10.0.0.2:80/desc.xml"),
 		[]byte("HTTP/1.1 404 Not Found\r\nLOCATION: http://10.0.0.3/desc.xml\r\n\r\n"),
+		[]byte("HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\n\r\n"),
 		[]byte("garbage-without-a-newline"),
 		[]byte("HTTP/1.1\r\n\r\n"),
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,8 +187,9 @@ func TestParseSSDP(t *testing.T) {
 	if got[0].Get("USN") == "" {
 		t.Error("other ssdp headers must survive parsing")
 	}
-	if _, err := parseSSDP([][]byte{[]byte("HTTP/1.1 500 Err\r\n\r\n")}); err == nil {
-		t.Error("want an error when nothing usable was parsed")
+	_, err = parseSSDP(datagrams("10.0.0.9:1900", []byte("HTTP/1.1 500 Err\r\n\r\n")))
+	if err == nil || !strings.Contains(err.Error(), "ssdp reply from 10.0.0.9:1900: 500 Err") {
+		t.Errorf("want the sender and status in the error, got %v", err)
 	}
 }
 
@@ -185,12 +198,12 @@ func TestParseSSDP(t *testing.T) {
 // stalls. A router's first reply is often the generic upnp:rootdevice, so its
 // IGD search target can arrive after its LOCATION was already seen.
 func TestParseSSDPGatewayFirst(t *testing.T) {
-	got, err := parseSSDP([][]byte{
+	got, err := parseSSDP(datagrams("10.0.0.1:1900",
 		ssdpOK("http://10.0.0.7/tv.xml"),
 		ssdpOK("http://10.0.0.1/igd.xml"),
 		ssdpST("http://10.0.0.8/nas.xml", "urn:schemas-upnp-org:device:MediaServer:1"),
 		ssdpST("http://10.0.0.1/igd.xml", "urn:schemas-upnp-org:device:InternetGatewayDevice:1"),
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +220,7 @@ func TestParseSSDPGatewayFirst(t *testing.T) {
 // net/http accepts a status line with no reason phrase; discovery must not be
 // stricter than the stdlib.
 func TestParseSSDPWithoutReasonPhrase(t *testing.T) {
-	got, err := parseSSDP([][]byte{[]byte("HTTP/1.1 200\r\nLOCATION: http://10.0.0.1/desc.xml\r\n\r\n")})
+	got, err := parseSSDP(datagrams("10.0.0.1:1900", []byte("HTTP/1.1 200\r\nLOCATION: http://10.0.0.1/desc.xml\r\n\r\n")))
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got %v err=%v, want the reply accepted", got, err)
 	}
@@ -248,6 +261,9 @@ func TestUDPRequestRetransmits(t *testing.T) {
 	}
 	if len(res) == 0 {
 		t.Fatal("no replies collected")
+	}
+	if res[0].from.Port() != uint16(port) {
+		t.Errorf("reply from %v, want the responder's address so errors and logs can name it", res[0].from)
 	}
 	if n := <-seen; n != 6 {
 		t.Errorf("router saw %d datagrams, want 6: both targets, three times", n)
@@ -308,11 +324,14 @@ func TestDeviceDescriptionErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := deviceDescription(http.Header{"Location": []string{srv.URL + "/500"}}); err == nil {
-		t.Error("want an error on a non-200 description")
+	_, err := deviceDescription(http.Header{"Location": []string{srv.URL + "/500"}})
+	for _, want := range []string{srv.URL + "/500", "500 Internal Server Error", "boom"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
 	}
-	if _, err := deviceDescription(http.Header{"Location": []string{srv.URL + "/junk"}}); err == nil {
-		t.Error("want an error when nothing usable parsed")
+	if _, err := deviceDescription(http.Header{"Location": []string{srv.URL + "/junk"}}); err == nil || !strings.Contains(err.Error(), "not a device description") {
+		t.Errorf("want an error saying what the body is not, got %v", err)
 	}
 }
 
@@ -339,8 +358,9 @@ func TestServiceActions(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0] != getExternalIPAddress {
 		t.Errorf("partial: got %v err=%v, want just GetExternalIPAddress", got, err)
 	}
-	if _, err := serviceActions(service{Location: srv.URL, SCPDURL: "/unrelated"}); err == nil {
-		t.Error("a service with none of our actions must not qualify")
+	_, err = serviceActions(service{Location: srv.URL, SCPDURL: "/unrelated", ServiceType: "urn:x:ContentDirectory:1"})
+	if err == nil || !strings.Contains(err.Error(), "urn:x:ContentDirectory:1 at "+srv.URL+"/unrelated: SCPD lists none of") {
+		t.Errorf("a service with none of our actions must not qualify, and must say so: %v", err)
 	}
 	if _, err := serviceActions(service{Location: srv.URL, SCPDURL: "/404"}); err == nil {
 		t.Error("want an error when the scpd is missing")
@@ -487,8 +507,14 @@ func TestUpnpServiceSkipsBadDevices(t *testing.T) {
 // client whose first call failed with `Post "": unsupported protocol scheme`.
 func TestUpnpServiceErrorsWithoutServices(t *testing.T) {
 	srv := fakeRouter(t)
-	if s, err := upnpService([]http.Header{location(srv.URL)}); err == nil {
-		t.Errorf("got %+v and no error, want an error", s)
+	s, err := upnpService([]http.Header{location(srv.URL)})
+	if err == nil {
+		t.Fatalf("got %+v and no error, want an error", s)
+	}
+	// Named by make, model and type, so the router stands apart from TVs and
+	// printers in a list of every device that answered.
+	if !strings.Contains(err.Error(), "(Acme R1, urn:schemas-upnp-org:device:InternetGatewayDevice:1): no port mapping service") {
+		t.Errorf("error lacks the device identity: %v", err)
 	}
 }
 
@@ -615,9 +641,69 @@ func TestNonFaultFailures(t *testing.T) {
 	if err == nil || errors.As(err, &upnpErr) {
 		t.Errorf("want a plain error for an undecodable 500, got %v", err)
 	}
+	for _, want := range []string{srv.URL + "/html500", "500 Internal Server Error", "<html>Internal Error</html>"} {
+		if err != nil && !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
 	c = &Client{service: service{Location: srv.URL, ControlURL: "/junk200"}}
-	if _, err := c.GetExternalIPAddress(); err == nil {
-		t.Error("want an error when a 200 body will not decode")
+	if _, err := c.GetExternalIPAddress(); err == nil || !strings.Contains(err.Error(), "undecodable 200 OK response") {
+		t.Errorf("want an error when a 200 body will not decode, got %v", err)
+	}
+}
+
+// An error from a Client call has to stand alone in a bug report: what was
+// asked, of which router and service, what its WAN looked like at discovery,
+// and what the router answered.
+func TestErrorShowsRequestAndGateway(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, faultResp("718"))
+	}))
+	defer srv.Close()
+
+	c := &Client{LocalIP: "10.0.0.5", service: service{
+		Location: srv.URL, ControlURL: "/ctl", ServiceType: "urn:x:WANIPConnection:1",
+		Device: "Acme R1", ExternalIP: "88.1.2.3",
+	}}
+	_, err := c.AddPortMapping(AddPortMappingRequest{NewInternalPort: 8080, NewProtocol: "tcp"})
+	want := "map TCP 8080 -> 10.0.0.5:8080, lease 3600s on Acme R1 at " + srv.URL +
+		"/ctl (urn:x:WANIPConnection:1, external ip 88.1.2.3 public): AddPortMapping: upnp error 718: test"
+	if err == nil || err.Error() != want {
+		t.Errorf("got  %v\nwant %s", err, want)
+	}
+	_, err = c.DeletePortMapping(DeletePortMappingRequest{NewExternalPort: 8080, NewProtocol: "tcp"})
+	if err == nil || !strings.HasPrefix(err.Error(), "unmap TCP 8080 on Acme R1 at "+srv.URL+"/ctl") {
+		t.Errorf("got %v", err)
+	}
+}
+
+// Routers routinely leave errorDescription empty; the spec's name for the code
+// takes its place so the error still says what went wrong.
+func TestFaultNamesEmptyDescription(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, strings.Replace(faultResp("606"), "<errorDescription>test</errorDescription>", "<errorDescription></errorDescription>", 1))
+	}))
+	defer srv.Close()
+
+	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
+	_, err := c.AddPortMapping(AddPortMappingRequest{NewInternalPort: 80})
+	var upnpErr *Error
+	if !errors.As(err, &upnpErr) || upnpErr.Description != "Action not authorized" {
+		t.Errorf("got %v", err)
+	}
+}
+
+// Errors carry the start of what a router sent, never a whole HTML page; the
+// full body is in the debug log.
+func TestSnippet(t *testing.T) {
+	if got := snippet([]byte("  short \n")); got != "short" {
+		t.Errorf("got %q", got)
+	}
+	got := snippet(bytes.Repeat([]byte("x"), 600))
+	if !strings.HasPrefix(got, strings.Repeat("x", 512)+"...") || !strings.HasSuffix(got, "(88 more bytes)") {
+		t.Errorf("got %q", got)
 	}
 }
 
@@ -682,8 +768,12 @@ func TestAddPortMappingGivesUpAfterOneRetry(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
-	if _, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewLeaseDuration: 3600}); err == nil {
+	_, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewLeaseDuration: 3600})
+	if err == nil {
 		t.Fatal("want the fault reported")
+	}
+	if !strings.Contains(err.Error(), "lease 0s after upnp error 725") {
+		t.Errorf("error must say the lease-0 retry happened: %v", err)
 	}
 	if calls != 2 {
 		t.Errorf("made %d calls, want exactly 2", calls)
@@ -791,5 +881,56 @@ func TestClientOperations(t *testing.T) {
 		NewExternalPort: 8080, NewProtocol: "TCP",
 	}); err != nil {
 		t.Errorf("DeletePortMapping: %v", err)
+	}
+}
+
+// Logger is how a failure on someone else's network gets diagnosed: one run has
+// to show every reply and its sender, which device each location is, every
+// service and WAN probe, the choice, and the SOAP bodies both ways.
+func TestLogging(t *testing.T) {
+	buf := &bytes.Buffer{}
+	Logger = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	t.Cleanup(func() { Logger = nil })
+
+	srv := fakeRouter(t,
+		fakeSvc{typ: "urn:x:WANPPPConnection:1", actions: allActions(), extIP: "0.0.0.0"},
+		fakeSvc{typ: "urn:x:WANIPConnection:1", actions: allActions(), extIP: "88.1.2.3"},
+	)
+	if _, err := parseSSDP(datagrams("10.0.0.1:1900", ssdpOK(srv.URL+"/desc.xml"))); err != nil {
+		t.Fatal(err)
+	}
+	s, err := upnpService([]http.Header{location(srv.URL)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{LocalIP: "10.0.0.5", service: s}
+	if _, err := c.AddPortMapping(AddPortMappingRequest{NewInternalPort: 8080, NewProtocol: "TCP"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DeletePortMapping(DeletePortMappingRequest{NewExternalPort: 8080, NewProtocol: "TCP"}); err != nil {
+		t.Fatal(err)
+	}
+	log := buf.String()
+	for _, want := range []string{
+		`msg="ssdp reply" from=10.0.0.1:1900`,
+		`server="Linux UPnP/1.1 fake/1.0"`,
+		`level=INFO msg="ssdp done" replies=1 devices=1`,
+		`msg=device location=` + srv.URL + `/desc.xml`,
+		`manufacturer=Acme model=R1`,
+		`msg=service base=`,
+		`actions="[AddPortMapping DeletePortMapping GetExternalIPAddress]"`,
+		`external_ip=0.0.0.0 class=unusable`,
+		`external_ip=88.1.2.3 class=public`,
+		`level=INFO msg="gateway selected" device="Acme R1"`,
+		`msg="soap request" action=AddPortMapping`,
+		`<NewExternalPort>8080</NewExternalPort>`,
+		`msg="soap response" action=AddPortMapping`,
+		`status="200 OK"`,
+		`level=INFO msg="port mapping added" external=8080 protocol=TCP internal_client=10.0.0.5 internal_port=8080 lease=3600`,
+		`level=INFO msg="port mapping deleted" external=8080 protocol=TCP`,
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log lacks %s", want)
+		}
 	}
 }

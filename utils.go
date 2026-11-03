@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -14,6 +15,20 @@ import (
 	"strings"
 	"time"
 )
+
+var Logger *slog.Logger
+
+func debug(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Debug(msg, args...)
+	}
+}
+
+func info(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Info(msg, args...)
+	}
+}
 
 var httpClient = &http.Client{
 	Timeout:   10 * time.Second,
@@ -25,6 +40,7 @@ const (
 	ssdpRetries  = 2
 	ssdpRetryGap = 500 * time.Millisecond
 	ssdpMargin   = 500 * time.Millisecond
+	ssdpWait     = ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin
 )
 
 var ssdpTargets = []string{
@@ -64,6 +80,14 @@ func latin1(_ string, r io.Reader) (io.Reader, error) {
 	return strings.NewReader(string(u)), nil
 }
 
+func snippet(b []byte) string {
+	b = bytes.TrimSpace(b)
+	if len(b) <= 512 {
+		return string(b)
+	}
+	return fmt.Sprintf("%s... (%d more bytes)", b[:512], len(b)-512)
+}
+
 func resolveURL(base, ref string) (string, error) {
 	b, err := url.Parse(base)
 	if err != nil {
@@ -76,7 +100,7 @@ func resolveURL(base, ref string) (string, error) {
 	return b.ResolveReference(r).String(), nil
 }
 
-func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([][]byte, error) {
+func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([]datagram, error) {
 	local, err := netip.ParseAddr(localIP)
 	if err != nil {
 		return nil, err
@@ -110,8 +134,8 @@ func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([][]byte
 			}
 		}
 	}()
-	deadline := time.Now().Add(ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin)
-	res := [][]byte{}
+	deadline := time.Now().Add(ssdpWait)
+	res := []datagram{}
 	var resErr error
 	for {
 		received := make([]byte, 4096)
@@ -120,15 +144,15 @@ func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([][]byte
 			resErr = err
 			break
 		}
-		n, err := socket.Read(received)
+		n, from, err := socket.ReadFromUDPAddrPort(received)
 		if err != nil {
 			resErr = err
 			break
 		}
-		res = append(res, received[:n])
+		res = append(res, datagram{from: from, data: received[:n]})
 	}
 	if len(res) == 0 {
-		return nil, fmt.Errorf("%s:%d no content, with error: %w", remoteIP, port, resErr)
+		return nil, fmt.Errorf("%s:%d: %w", remoteIP, port, resErr)
 	}
 	return res, nil
 }
@@ -151,12 +175,14 @@ func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
 	buf.WriteString(envelopeOpen)
 	buf.Write(body)
 	buf.WriteString(envelopeClose)
+	soapAction := fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)
+	debug("soap request", "action", action, "url", url, "soapaction", soapAction, "body", buf.String())
 	req, err := http.NewRequest(http.MethodPost, url, buf)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header["SOAPAction"] = []string{fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)}
+	req.Header["SOAPAction"] = []string{soapAction}
 	req.Header["Content-Type"] = []string{`text/xml; charset="utf-8"`}
 	return req, nil
 }
@@ -164,23 +190,29 @@ func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
 func doRequest(action string, req *http.Request) (envelope, error) {
 	res, err := httpClient.Do(req)
 	if err != nil {
-		return envelope{}, err
+		return envelope{}, fmt.Errorf("%s: %w", action, err)
 	}
 	defer res.Body.Close()
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return envelope{}, err
+		return envelope{}, fmt.Errorf("%s: reading the %s response: %w", action, res.Status, err)
 	}
+	debug("soap response", "action", action, "url", req.URL.String(), "status", res.Status,
+		"server", res.Header.Get("Server"), "body", string(resBody))
 	envelopeRes := envelope{}
 	decodeErr := decodeXML(resBody, &envelopeRes)
 	if f := envelopeRes.Body.Fault; f != nil {
-		return envelope{}, &Error{Action: action, Code: f.Code, Description: f.Description}
+		desc := f.Description
+		if desc == "" {
+			desc = errorNames[f.Code]
+		}
+		return envelope{}, &Error{Action: action, Code: f.Code, Description: desc}
 	}
 	if res.StatusCode != http.StatusOK {
-		return envelope{}, fmt.Errorf("%s: not ok: %s: %s", action, res.Status, resBody)
+		return envelope{}, fmt.Errorf("%s: %s: %s", action, res.Status, snippet(resBody))
 	}
 	if decodeErr != nil {
-		return envelope{}, decodeErr
+		return envelope{}, fmt.Errorf("%s: undecodable %s response: %w: %s", action, res.Status, decodeErr, snippet(resBody))
 	}
 	return envelopeRes, nil
 }
