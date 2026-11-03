@@ -5,29 +5,87 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
+var Logger *slog.Logger
+
+func debug(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Debug(msg, args...)
+	}
+}
+
+func info(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Info(msg, args...)
+	}
+}
+
+var httpClient = &http.Client{
+	Timeout:   10 * time.Second,
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
 
 const (
 	ssdpMX       = 5 * time.Second
 	ssdpRetries  = 2
 	ssdpRetryGap = 500 * time.Millisecond
 	ssdpMargin   = 500 * time.Millisecond
+	ssdpWait     = ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin
 )
+
+var ssdpTargets = []string{
+	"ssdp:all",
+	"upnp:rootdevice",
+	"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+	"urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+}
+
+func mSearch(st string) []byte {
+	return []byte("M-SEARCH * HTTP/1.1\r\n" +
+		"HOST: 239.255.255.250:1900\r\n" +
+		"MAN: \"ssdp:discover\"\r\n" +
+		"MX: " + strconv.Itoa(int(ssdpMX/time.Second)) + "\r\n" +
+		"ST: " + st + "\r\n" +
+		"USER-AGENT: Golang/" + strings.TrimPrefix(runtime.Version(), "go") + " UPnP/1.1 Upnp/1.0\r\n" +
+		"\r\n")
+}
 
 func decodeXML(b []byte, v any) error {
 	d := xml.NewDecoder(bytes.NewReader(b))
 	d.Strict = false
 	d.Entity = xml.HTMLEntity
-	d.AutoClose = xml.HTMLAutoClose
+	d.CharsetReader = latin1
 	return d.Decode(v)
+}
+
+func latin1(_ string, r io.Reader) (io.Reader, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	u := make([]rune, len(b))
+	for i, c := range b {
+		u[i] = rune(c)
+	}
+	return strings.NewReader(string(u)), nil
+}
+
+func snippet(b []byte) string {
+	b = bytes.TrimSpace(b)
+	if len(b) <= 512 {
+		return string(b)
+	}
+	return fmt.Sprintf("%s... (%d more bytes)", b[:512], len(b)-512)
 }
 
 func resolveURL(base, ref string) (string, error) {
@@ -42,19 +100,7 @@ func resolveURL(base, ref string) (string, error) {
 	return b.ResolveReference(r).String(), nil
 }
 
-func httpRequest(r http.Request) []byte {
-	r.Header["USER-AGENT"] = []string{"Golang/1.23.3 UPnP/1.1 Upnp/1.0"}
-	b := bytes.NewBuffer(nil)
-	b.WriteString(r.Method)
-	b.WriteString(" * HTTP/1.1\r\n")
-	for k, v := range r.Header {
-		b.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, "; ")))
-	}
-	b.WriteString("\r\n")
-	return b.Bytes()
-}
-
-func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, error) {
+func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([]datagram, error) {
 	local, err := netip.ParseAddr(localIP)
 	if err != nil {
 		return nil, err
@@ -75,18 +121,21 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 		IP:   ip.AsSlice(),
 		Port: port,
 	}
-	_, err = socket.WriteToUDP(payload, remote)
-	if err != nil {
-		return nil, err
+	for _, p := range payloads {
+		if _, err := socket.WriteToUDP(p, remote); err != nil {
+			return nil, err
+		}
 	}
 	go func() {
 		for range ssdpRetries {
 			time.Sleep(ssdpRetryGap)
-			socket.WriteToUDP(payload, remote)
+			for _, p := range payloads {
+				socket.WriteToUDP(p, remote)
+			}
 		}
 	}()
-	deadline := time.Now().Add(ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin)
-	res := [][]byte{}
+	deadline := time.Now().Add(ssdpWait)
+	res := []datagram{}
 	var resErr error
 	for {
 		received := make([]byte, 4096)
@@ -95,15 +144,15 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 			resErr = err
 			break
 		}
-		n, err := socket.Read(received)
+		n, from, err := socket.ReadFromUDPAddrPort(received)
 		if err != nil {
 			resErr = err
 			break
 		}
-		res = append(res, received[:n])
+		res = append(res, datagram{from: from, data: received[:n]})
 	}
 	if len(res) == 0 {
-		return nil, fmt.Errorf("%s:%d no content, with error: %s", remoteIP, port, resErr)
+		return nil, fmt.Errorf("%s:%d: %w", remoteIP, port, resErr)
 	}
 	return res, nil
 }
@@ -126,37 +175,44 @@ func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
 	buf.WriteString(envelopeOpen)
 	buf.Write(body)
 	buf.WriteString(envelopeClose)
+	soapAction := fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)
+	debug("soap request", "action", action, "url", url, "soapaction", soapAction, "body", buf.String())
 	req, err := http.NewRequest(http.MethodPost, url, buf)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header["SOAPAction"] = []string{fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)}
-	req.Header["Content-Type"] = []string{"text/xml; charset=utf-8"}
+	req.Header["SOAPAction"] = []string{soapAction}
+	req.Header["Content-Type"] = []string{`text/xml; charset="utf-8"`}
 	return req, nil
 }
 
 func doRequest(action string, req *http.Request) (envelope, error) {
 	res, err := httpClient.Do(req)
 	if err != nil {
-		return envelope{}, err
+		return envelope{}, fmt.Errorf("%s: %w", action, err)
 	}
 	defer res.Body.Close()
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return envelope{}, err
+		return envelope{}, fmt.Errorf("%s: reading the %s response: %w", action, res.Status, err)
 	}
+	debug("soap response", "action", action, "url", req.URL.String(), "status", res.Status,
+		"server", res.Header.Get("Server"), "body", string(resBody))
 	envelopeRes := envelope{}
-	unmarshalErr := xml.Unmarshal(resBody, &envelopeRes)
-	if res.StatusCode != http.StatusOK {
-		if unmarshalErr == nil && envelopeRes.Body.Fault != nil {
-			f := envelopeRes.Body.Fault
-			return envelope{}, &Error{Action: action, Code: f.Code, Description: f.Description}
+	decodeErr := decodeXML(resBody, &envelopeRes)
+	if f := envelopeRes.Body.Fault; f != nil {
+		desc := f.Description
+		if desc == "" {
+			desc = errorNames[f.Code]
 		}
-		return envelope{}, fmt.Errorf("%s: not ok: %s: %s", action, res.Status, resBody)
+		return envelope{}, &Error{Action: action, Code: f.Code, Description: desc}
 	}
-	if unmarshalErr != nil {
-		return envelope{}, unmarshalErr
+	if res.StatusCode != http.StatusOK {
+		return envelope{}, fmt.Errorf("%s: %s: %s", action, res.Status, snippet(resBody))
+	}
+	if decodeErr != nil {
+		return envelope{}, fmt.Errorf("%s: undecodable %s response: %w: %s", action, res.Status, decodeErr, snippet(resBody))
 	}
 	return envelopeRes, nil
 }

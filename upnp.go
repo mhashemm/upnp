@@ -8,24 +8,23 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/textproto"
+	"net/netip"
 	"slices"
-	"strconv"
-	"time"
+	"strings"
 )
 
 func New() (*Client, error) {
-	localIP := GetLocalIPAddr()
-	if localIP == "" {
-		return nil, errors.New("no outbound route: cannot determine local ip")
+	localIP, err := localIPAddr()
+	if err != nil {
+		return nil, fmt.Errorf("no outbound route, cannot determine the local ip: %w", err)
 	}
 	headers, err := discover(localIP)
 	if err != nil {
-		return nil, fmt.Errorf("no ssdp reply on %s (a vpn or virtual interface can route the multicast away from your lan): %w", localIP, err)
+		return nil, err
 	}
 	service, err := upnpService(headers)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no upnp gateway among the %d devices that answered:\n%w", len(headers), err)
 	}
 	return &Client{
 		LocalIP: localIP,
@@ -34,114 +33,193 @@ func New() (*Client, error) {
 }
 
 func GetLocalIPAddr() string {
+	ip, _ := localIPAddr()
+	return ip
+}
+
+func localIPAddr() (string, error) {
 	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
 		IP:   []byte{6, 9, 6, 9},
 		Port: 6969,
 	})
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Unix(0, 0))
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
 
 func upnpService(headers []http.Header) (service, error) {
 	errs := []error{}
 	all := []service{}
 	for _, header := range headers {
+		location := header.Get("LOCATION")
 		dd, err := deviceDescription(header)
 		if err != nil {
+			debug("device skipped", "location", location, "err", err)
 			errs = append(errs, err)
 			continue
 		}
 		base := dd.BaseUrl
 		if base == "" {
-			base = header.Get("LOCATION")
+			base = location
 		}
 		candidates, err := getConnectionService(base, dd.Device)
 		if len(candidates) == 0 {
+			if err == nil {
+				err = errors.New("no service offers " + strings.Join(supported, ", "))
+			}
+			err = fmt.Errorf("%s%s: no port mapping service: %w", location, note(identity(dd), dd.Device.DeviceType), err)
+			debug("device skipped", "location", location, "err", err)
 			errs = append(errs, err)
 			continue
 		}
+		for i := range candidates {
+			candidates[i].Device = identity(dd)
+		}
 		if s, ok := connectedService(candidates); ok {
+			selected(s)
 			return s, nil
 		}
 		all = append(all, candidates...)
 	}
 	if len(all) > 0 {
+		selected(all[0])
 		return all[0], nil
 	}
 	return service{}, errors.Join(errs...)
 }
 
-func connectedService(candidates []service) (service, bool) {
-	for _, s := range candidates {
-		res, err := (&Client{service: s}).GetExternalIPAddress()
-		if err != nil {
-			continue
-		}
-		if ip := res.NewExternalIPAddress; ip != "" && ip != "0.0.0.0" {
-			return s, true
+func identity(dd root) string {
+	return strings.Join(strings.Fields(dd.Device.Manufacturer+" "+dd.Device.ModelName+" "+dd.Device.ModelNumber), " ")
+}
+
+func note(parts ...string) string {
+	kept := []string{}
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			kept = append(kept, p)
 		}
 	}
-	return service{}, false
+	if len(kept) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(kept, ", ") + ")"
+}
+
+func (s service) String() string {
+	control, err := resolveURL(s.Location, s.ControlURL)
+	if err != nil {
+		control = s.ControlURL
+	}
+	wan := ""
+	if s.ExternalIP != "" {
+		wan = "external ip " + strings.TrimSpace(s.ExternalIP) + " " + ipClass(s.ExternalIP)
+	}
+	gateway := control + note(s.ServiceType, wan)
+	if s.Device != "" {
+		gateway = s.Device + " at " + gateway
+	}
+	return gateway
+}
+
+func selected(s service) {
+	info("gateway selected", "device", s.Device, "base", s.Location, "service", s.ServiceType, "control", s.ControlURL,
+		"external_ip", s.ExternalIP, "class", ipClass(s.ExternalIP))
+}
+
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+func ipClass(s string) string {
+	ip, err := netip.ParseAddr(strings.TrimSpace(s))
+	switch {
+	case err != nil || !ip.IsGlobalUnicast():
+		return "unusable"
+	case ip.IsPrivate() || sharedAddressSpace.Contains(ip):
+		return "private"
+	}
+	return "public"
+}
+
+func connectedService(candidates []service) (service, bool) {
+	private := []service{}
+	for i := range candidates {
+		s := &candidates[i]
+		res, err := (&Client{service: *s}).GetExternalIPAddress()
+		s.ExternalIP = res.NewExternalIPAddress
+		class := ipClass(s.ExternalIP)
+		debug("wan probe", "service", s.ServiceType, "control", s.ControlURL, "external_ip", s.ExternalIP, "class", class, "err", err)
+		if class == "public" {
+			return *s, true
+		}
+		if class == "private" {
+			private = append(private, *s)
+		}
+	}
+	if len(private) == 0 {
+		return service{}, false
+	}
+	return private[0], true
 }
 
 func discover(localIP string) ([]http.Header, error) {
-	header := http.Header{}
-	header["HOST"] = []string{"239.255.255.250:1900"}
-	header["ST"] = []string{"ssdp:all"}
-	header["MAN"] = []string{"\"ssdp:discover\""}
-	header["MX"] = []string{strconv.Itoa(int(ssdpMX / time.Second))}
-	req := http.Request{
-		Method: "M-SEARCH",
-		Header: header,
+	payloads := [][]byte{}
+	for _, st := range ssdpTargets {
+		payloads = append(payloads, mSearch(st))
 	}
-	devices, err := udpRequest(localIP, "239.255.255.250", 1900, httpRequest(req))
+	debug("ssdp search", "local", localIP, "targets", ssdpTargets, "wait", ssdpWait)
+	devices, err := udpRequest(localIP, "239.255.255.250", 1900, payloads)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no ssdp reply within %s to %d searches sent %d times from %s; upnp may be off on the router, or a vpn, virtual interface or firewall is in the way: %w",
+			ssdpWait, len(ssdpTargets), ssdpRetries+1, localIP, err)
 	}
 	return parseSSDP(devices)
 }
 
-func parseSSDP(devices [][]byte) ([]http.Header, error) {
+func parseSSDP(devices []datagram) ([]http.Header, error) {
 	headers := []http.Header{}
 	errs := []error{}
 	seen := map[string]bool{}
-	for _, res := range devices {
-		httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
-		if !found {
-			errs = append(errs, fmt.Errorf("invalid response: %s\n", res))
-			continue
-		}
-		s := bytes.Split(httpRes, []byte{' '})
-		if len(s) < 3 {
-			errs = append(errs, fmt.Errorf("invalid response: %s\n", headerRes))
-			continue
-		}
-		statusCode := string(s[1])
-		if statusCode != strconv.Itoa(http.StatusOK) {
-			errs = append(errs, fmt.Errorf("not ok: %s\n", headerRes))
-			continue
-		}
-		_header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerRes))).ReadMIMEHeader()
+	rank := map[string]int{}
+	for _, d := range devices {
+		res, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(d.data)), nil)
 		if err != nil {
-			errs = append(errs, err)
+			debug("ssdp reply unreadable", "from", d.from, "err", err, "raw", string(d.data))
+			errs = append(errs, fmt.Errorf("ssdp reply from %s: %w: %q", d.from, err, d.data))
 			continue
 		}
-		header := http.Header(_header)
-		location := header.Get("LOCATION")
+		location := res.Header.Get("LOCATION")
+		debug("ssdp reply", "from", d.from, "status", res.Status, "st", res.Header.Get("ST"), "location", location,
+			"server", res.Header.Get("SERVER"), "usn", res.Header.Get("USN"))
+		if res.StatusCode != http.StatusOK {
+			errs = append(errs, fmt.Errorf("ssdp reply from %s: %s", d.from, res.Status))
+			continue
+		}
+		if location == "" {
+			errs = append(errs, fmt.Errorf("ssdp reply from %s has no LOCATION", d.from))
+			continue
+		}
+		if st := res.Header.Get("ST"); strings.Contains(st, "InternetGatewayDevice") || wanConnection(st) {
+			rank[location] = -1
+		}
 		if seen[location] {
 			continue
 		}
 		seen[location] = true
-		headers = append(headers, header)
+		headers = append(headers, res.Header)
 	}
 	if len(headers) == 0 {
-		return nil, errors.Join(errs...)
+		return nil, fmt.Errorf("%d ssdp replies, none usable:\n%w", len(devices), errors.Join(errs...))
 	}
+	slices.SortStableFunc(headers, func(a, b http.Header) int {
+		return rank[a.Get("LOCATION")] - rank[b.Get("LOCATION")]
+	})
+	info("ssdp done", "replies", len(devices), "devices", len(headers), "gateways", len(rank))
 	return headers, nil
+}
+
+func wanConnection(s string) bool {
+	return strings.Contains(s, "WANIPConnection") || strings.Contains(s, "WANPPPConnection")
 }
 
 func deviceDescription(header http.Header) (root, error) {
@@ -154,14 +232,17 @@ func deviceDescription(header http.Header) (root, error) {
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return r, err
+		return r, fmt.Errorf("GET %s: %w", location, err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return r, fmt.Errorf("%s: %s", res.Status, body)
+		return r, fmt.Errorf("GET %s: %s: %s", location, res.Status, snippet(body))
 	}
 	if err := decodeXML(body, &r); err != nil && len(r.Device.ServiceList) == 0 && len(r.Device.DeviceList) == 0 {
-		return r, fmt.Errorf("%s: %w", location, err)
+		return r, fmt.Errorf("GET %s: not a device description: %w: %s", location, err, snippet(body))
 	}
+	debug("device", "location", location, "server", res.Header.Get("Server"), "type", r.Device.DeviceType,
+		"manufacturer", r.Device.Manufacturer, "model", r.Device.ModelName, "number", r.Device.ModelNumber,
+		"name", r.Device.FriendlyName, "urlbase", r.BaseUrl, "body", string(body))
 	return r, nil
 }
 
@@ -177,14 +258,14 @@ func serviceActions(s service) ([]string, error) {
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s responed with status=%d body=[%s]", url, res.StatusCode, body)
+		return nil, fmt.Errorf("GET %s: %s: %s", url, res.Status, snippet(body))
 	}
 	desc := description{}
 	if err := decodeXML(body, &desc); err != nil && len(desc.ActionList) == 0 {
-		return nil, err
+		return nil, fmt.Errorf("GET %s: not an SCPD: %w: %s", url, err, snippet(body))
 	}
 
 	actions := []string{}
@@ -194,7 +275,7 @@ func serviceActions(s service) ([]string, error) {
 		}
 	}
 	if len(actions) == 0 {
-		return nil, fmt.Errorf("%s service is not valid", url)
+		return nil, fmt.Errorf("%s at %s: SCPD lists none of %s", s.ServiceType, url, strings.Join(supported, ", "))
 	}
 	return actions, nil
 }
@@ -205,8 +286,13 @@ func getConnectionService(location string, rootDevice device) ([]service, error)
 	for _, s := range rootDevice.ServiceList {
 		s.Location = location
 		actions, err := serviceActions(s)
+		keep := err == nil || wanConnection(s.ServiceType)
+		debug("service", "base", location, "type", s.ServiceType, "control", s.ControlURL, "scpd", s.SCPDURL,
+			"actions", actions, "candidate", keep, "err", err)
 		if err != nil {
 			errs = append(errs, err)
+		}
+		if !keep {
 			continue
 		}
 		s.Actions = actions
@@ -221,40 +307,78 @@ func getConnectionService(location string, rootDevice device) ([]service, error)
 	return services, errors.Join(errs...)
 }
 
+func (c *Client) fail(what string, err error) error {
+	return fmt.Errorf("%s on %s: %w", what, c.service, err)
+}
+
+func mapping(msg AddPortMappingRequest, retried bool) string {
+	what := fmt.Sprintf("map %s %d -> %s:%d, lease %ds", msg.NewProtocol, msg.NewExternalPort, msg.NewInternalClient, msg.NewInternalPort, msg.NewLeaseDuration)
+	if retried {
+		what += " after upnp error 725"
+	}
+	return what
+}
+
 func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
+	if msg.NewExternalPort == 0 {
+		msg.NewExternalPort = msg.NewInternalPort
+	}
+	if msg.NewExternalPort == 0 {
+		return AddPortMappingResponse{}, errors.New("AddPortMapping: NewInternalPort or NewExternalPort is required")
+	}
 	if msg.NewInternalClient == "" {
 		msg.NewInternalClient = c.LocalIP
 	}
+	if msg.NewEnabled == 0 {
+		msg.NewEnabled = 1
+	}
+	if msg.NewLeaseDuration == 0 {
+		msg.NewLeaseDuration = 3600
+	}
+	msg.NewProtocol = strings.ToUpper(msg.NewProtocol)
 	msg.XMLNS = c.service.ServiceType
-	req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
-	if err != nil {
-		return AddPortMappingResponse{}, err
+	retried := false
+	for {
+		req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
+		if err != nil {
+			return AddPortMappingResponse{}, c.fail(mapping(msg, retried), err)
+		}
+		res, err := doRequest(addPortMapping, req)
+		var upnpErr *Error
+		if errors.As(err, &upnpErr) && upnpErr.Code == ErrOnlyPermanentLease && msg.NewLeaseDuration != 0 {
+			info("router only allows permanent leases, retrying with lease 0", "requested", msg.NewLeaseDuration)
+			msg.NewLeaseDuration = 0
+			retried = true
+			continue
+		}
+		if err != nil {
+			return AddPortMappingResponse{}, c.fail(mapping(msg, retried), err)
+		}
+		info("port mapping added", "external", msg.NewExternalPort, "protocol", msg.NewProtocol,
+			"internal_client", msg.NewInternalClient, "internal_port", msg.NewInternalPort,
+			"lease", msg.NewLeaseDuration, "gateway", c.service.String())
+		out := AddPortMappingResponse{}
+		if res.Body.AddPortMappingResponse != nil {
+			out = *res.Body.AddPortMappingResponse
+		}
+		out.LeaseDuration = msg.NewLeaseDuration
+		return out, nil
 	}
-	res, err := doRequest(addPortMapping, req)
-	var upnpErr *Error
-	if errors.As(err, &upnpErr) && upnpErr.Code == ErrOnlyPermanentLease && msg.NewLeaseDuration != 0 {
-		msg.NewLeaseDuration = 0
-		return c.AddPortMapping(msg)
-	}
-	if err != nil {
-		return AddPortMappingResponse{}, err
-	}
-	if res.Body.AddPortMappingResponse == nil {
-		return AddPortMappingResponse{}, nil
-	}
-	return *res.Body.AddPortMappingResponse, nil
 }
 
 func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
+	msg.NewProtocol = strings.ToUpper(msg.NewProtocol)
 	msg.XMLNS = c.service.ServiceType
+	what := fmt.Sprintf("unmap %s %d", msg.NewProtocol, msg.NewExternalPort)
 	req, err := newEnvelopeReq(deletePortMapping, c.service, &msg)
 	if err != nil {
-		return DeletePortMappingResponse{}, err
+		return DeletePortMappingResponse{}, c.fail(what, err)
 	}
 	res, err := doRequest(deletePortMapping, req)
 	if err != nil {
-		return DeletePortMappingResponse{}, err
+		return DeletePortMappingResponse{}, c.fail(what, err)
 	}
+	info("port mapping deleted", "external", msg.NewExternalPort, "protocol", msg.NewProtocol, "gateway", c.service.String())
 	if res.Body.DeletePortMappingResponse == nil {
 		return DeletePortMappingResponse{}, nil
 	}
@@ -267,11 +391,11 @@ func (c *Client) GetExternalIPAddress() (GetExternalIPAddressResponse, error) {
 	}
 	req, err := newEnvelopeReq(getExternalIPAddress, c.service, &msg)
 	if err != nil {
-		return GetExternalIPAddressResponse{}, err
+		return GetExternalIPAddressResponse{}, c.fail("get external ip", err)
 	}
 	res, err := doRequest(getExternalIPAddress, req)
 	if err != nil {
-		return GetExternalIPAddressResponse{}, err
+		return GetExternalIPAddressResponse{}, c.fail("get external ip", err)
 	}
 	if res.Body.GetExternalIPAddressResponse == nil {
 		return GetExternalIPAddressResponse{}, nil

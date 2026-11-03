@@ -3,6 +3,7 @@ package upnp
 import (
 	"encoding/xml"
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -33,10 +34,16 @@ type service struct {
 	SCPDURL     string   `xml:"SCPDURL"`
 	Location    string   `xml:"-"`
 	Actions     []string `xml:"-"`
+	Device      string   `xml:"-"`
+	ExternalIP  string   `xml:"-"`
 }
 type device struct {
 	XMLName      xml.Name  `xml:"device"`
 	DeviceType   string    `xml:"deviceType"`
+	FriendlyName string    `xml:"friendlyName"`
+	Manufacturer string    `xml:"manufacturer"`
+	ModelName    string    `xml:"modelName"`
+	ModelNumber  string    `xml:"modelNumber"`
 	SerialNumber string    `xml:"serialNumber"`
 	UDN          string    `xml:"UDN"`
 	ServiceList  []service `xml:"serviceList>service"`
@@ -87,11 +94,38 @@ type fault struct {
 	Description string `xml:"detail>UPnPError>errorDescription"`
 }
 
+type datagram struct {
+	from netip.AddrPort
+	data []byte
+}
+
 const (
 	ErrNoSuchEntryInArray     = 714
 	ErrConflictInMappingEntry = 718
 	ErrOnlyPermanentLease     = 725
 )
+
+var errorNames = map[int]string{
+	401: "Invalid Action",
+	402: "Invalid Args",
+	501: "Action Failed",
+	600: "Argument Value Invalid",
+	601: "Argument Value Out of Range",
+	602: "Optional Action Not Implemented",
+	606: "Action not authorized",
+	713: "SpecifiedArrayIndexInvalid",
+	714: "NoSuchEntryInArray",
+	715: "WildCardNotPermittedInSrcIP",
+	716: "WildCardNotPermittedInExtPort",
+	718: "ConflictInMappingEntry",
+	724: "SamePortValuesRequired",
+	725: "OnlyPermanentLeasesSupported",
+	726: "RemoteHostOnlySupportsWildcard",
+	727: "ExternalPortOnlySupportsWildcard",
+	728: "NoPortMapsAvailable",
+	729: "ConflictWithOtherMechanisms",
+	732: "WildCardNotPermittedInIntPort",
+}
 
 type Error struct {
 	Action      string
@@ -129,7 +163,9 @@ type GetExternalIPAddressRequest struct {
 	XMLNS   string   `xml:"xmlns:u,attr"`
 }
 
-type AddPortMappingResponse struct{}
+type AddPortMappingResponse struct {
+	LeaseDuration int `xml:"-"`
+}
 
 type DeletePortMappingResponse struct{}
 
