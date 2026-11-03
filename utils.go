@@ -27,13 +27,22 @@ const (
 	ssdpMargin   = 500 * time.Millisecond
 )
 
-var mSearch = "M-SEARCH * HTTP/1.1\r\n" +
-	"HOST: 239.255.255.250:1900\r\n" +
-	"MAN: \"ssdp:discover\"\r\n" +
-	"MX: " + strconv.Itoa(int(ssdpMX/time.Second)) + "\r\n" +
-	"ST: ssdp:all\r\n" +
-	"USER-AGENT: Golang/" + strings.TrimPrefix(runtime.Version(), "go") + " UPnP/1.1 Upnp/1.0\r\n" +
-	"\r\n"
+var ssdpTargets = []string{
+	"ssdp:all",
+	"upnp:rootdevice",
+	"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+	"urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+}
+
+func mSearch(st string) []byte {
+	return []byte("M-SEARCH * HTTP/1.1\r\n" +
+		"HOST: 239.255.255.250:1900\r\n" +
+		"MAN: \"ssdp:discover\"\r\n" +
+		"MX: " + strconv.Itoa(int(ssdpMX/time.Second)) + "\r\n" +
+		"ST: " + st + "\r\n" +
+		"USER-AGENT: Golang/" + strings.TrimPrefix(runtime.Version(), "go") + " UPnP/1.1 Upnp/1.0\r\n" +
+		"\r\n")
+}
 
 func decodeXML(b []byte, v any) error {
 	d := xml.NewDecoder(bytes.NewReader(b))
@@ -67,7 +76,7 @@ func resolveURL(base, ref string) (string, error) {
 	return b.ResolveReference(r).String(), nil
 }
 
-func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, error) {
+func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([][]byte, error) {
 	local, err := netip.ParseAddr(localIP)
 	if err != nil {
 		return nil, err
@@ -88,14 +97,17 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 		IP:   ip.AsSlice(),
 		Port: port,
 	}
-	_, err = socket.WriteToUDP(payload, remote)
-	if err != nil {
-		return nil, err
+	for _, p := range payloads {
+		if _, err := socket.WriteToUDP(p, remote); err != nil {
+			return nil, err
+		}
 	}
 	go func() {
 		for range ssdpRetries {
 			time.Sleep(ssdpRetryGap)
-			socket.WriteToUDP(payload, remote)
+			for _, p := range payloads {
+				socket.WriteToUDP(p, remote)
+			}
 		}
 	}()
 	deadline := time.Now().Add(ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin)
@@ -145,7 +157,7 @@ func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
 	}
 
 	req.Header["SOAPAction"] = []string{fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)}
-	req.Header["Content-Type"] = []string{"text/xml; charset=utf-8"}
+	req.Header["Content-Type"] = []string{`text/xml; charset="utf-8"`}
 	return req, nil
 }
 

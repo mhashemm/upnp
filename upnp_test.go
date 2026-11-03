@@ -114,20 +114,30 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
-// net/http cannot serialize a non-HTTP method to "*", so the datagram is a
-// literal. Built from a map, its header order changed from run to run, and all
-// three retransmits share one payload, so an order-sensitive SSDP stack would
-// fail whole New() calls at random.
+// net/http cannot serialize a non-HTTP method to "*", so each datagram is a
+// literal with a fixed header order; built from a map, the order changed from
+// run to run. ssdp:all alone misses gateways: some routers answer it with only
+// their first descriptor, typically the WPS WFADevice (tailscale/tailscale
+// #3557). miniupnpc never uses it to find a gateway and searches
+// InternetGatewayDevice:1 instead; libtorrent searches only upnp:rootdevice.
 func TestMSearch(t *testing.T) {
-	if !strings.HasPrefix(mSearch, "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n") {
-		t.Errorf("request line then HOST must lead: %q", mSearch)
+	for _, st := range []string{"ssdp:all", "upnp:rootdevice", "urn:schemas-upnp-org:device:InternetGatewayDevice:1", "urn:schemas-upnp-org:device:InternetGatewayDevice:2"} {
+		if !slices.Contains(ssdpTargets, st) {
+			t.Errorf("missing search target %q", st)
+		}
 	}
-	if !strings.HasSuffix(mSearch, "\r\n\r\n") {
-		t.Errorf("headers must end with a blank line: %q", mSearch)
-	}
-	for _, want := range []string{"\r\nMAN: \"ssdp:discover\"\r\n", "\r\nMX: 5\r\n", "\r\nST: ssdp:all\r\n", "\r\nUSER-AGENT: "} {
-		if !strings.Contains(mSearch, want) {
-			t.Errorf("missing %q in %q", want, mSearch)
+	for _, st := range ssdpTargets {
+		m := string(mSearch(st))
+		if !strings.HasPrefix(m, "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n") {
+			t.Errorf("request line then HOST must lead: %q", m)
+		}
+		if !strings.HasSuffix(m, "\r\n\r\n") {
+			t.Errorf("headers must end with a blank line: %q", m)
+		}
+		for _, want := range []string{"\r\nMAN: \"ssdp:discover\"\r\n", "\r\nMX: 5\r\n", "\r\nST: " + st + "\r\n", "\r\nUSER-AGENT: "} {
+			if !strings.Contains(m, want) {
+				t.Errorf("missing %q in %q", want, m)
+			}
 		}
 	}
 }
@@ -203,8 +213,8 @@ func TestParseSSDPWithoutReasonPhrase(t *testing.T) {
 	}
 }
 
-// A dropped M-SEARCH is indistinguishable from a router without UPnP, so the
-// datagram goes out more than once.
+// A dropped M-SEARCH is indistinguishable from a router without UPnP, so every
+// search target goes out more than once.
 func TestUDPRequestRetransmits(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits out the 6.5s ssdp deadline")
@@ -232,15 +242,15 @@ func TestUDPRequestRetransmits(t *testing.T) {
 		}
 	}()
 
-	res, err := udpRequest("127.0.0.1", "127.0.0.1", port, []byte("M-SEARCH * HTTP/1.1\r\n\r\n"))
+	res, err := udpRequest("127.0.0.1", "127.0.0.1", port, [][]byte{mSearch("ssdp:all"), mSearch("upnp:rootdevice")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(res) == 0 {
 		t.Fatal("no replies collected")
 	}
-	if n := <-seen; n != 3 {
-		t.Errorf("router saw %d datagrams, want 3", n)
+	if n := <-seen; n != 6 {
+		t.Errorf("router saw %d datagrams, want 6: both targets, three times", n)
 	}
 }
 
@@ -388,11 +398,16 @@ func TestGetConnectionServiceRanksAndRecurses(t *testing.T) {
 // of them live; the dead one reports 0.0.0.0.
 func TestConnectedServicePrefersLiveWAN(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/dead" {
+		switch r.URL.Path {
+		case "/dead":
 			io.WriteString(w, extIPResp("0.0.0.0"))
-			return
+		case "/cgn":
+			io.WriteString(w, extIPResp("100.70.1.2"))
+		case "/public":
+			io.WriteString(w, extIPResp(" 88.1.2.3\n"))
+		default:
+			io.WriteString(w, extIPResp("10.207.82.233"))
 		}
-		io.WriteString(w, extIPResp("10.207.82.233"))
 	}))
 	defer srv.Close()
 
@@ -409,6 +424,14 @@ func TestConnectedServicePrefersLiveWAN(t *testing.T) {
 	// is a working connection.
 	if _, ok := connectedService([]service{live}); !ok {
 		t.Error("a private external ip is still a connected wan")
+	}
+	// ISP routers also list management or VoIP connections with private
+	// addresses beside the internet one, so a public address wins wherever it
+	// sits (tailscale/tailscale#8364), and a CGN 100.64/10 address is private.
+	cgn := service{Location: srv.URL, ControlURL: "/cgn", ServiceType: "cgn"}
+	public := service{Location: srv.URL, ControlURL: "/public", ServiceType: "public"}
+	if got, _ := connectedService([]service{live, cgn, public}); got.ServiceType != "public" {
+		t.Errorf("picked %q, want the wan with a public address", got.ServiceType)
 	}
 }
 
@@ -510,6 +533,10 @@ func TestEnvelope(t *testing.T) {
 	wantAction := "SOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#GetExternalIPAddress\"\r\n"
 	if !strings.Contains(wire.String(), wantAction) {
 		t.Errorf("headers = %q, want %q", wire, wantAction)
+	}
+	// Byte for byte what miniupnpc and libtorrent send, quotes included.
+	if wantType := "Content-Type: text/xml; charset=\"utf-8\"\r\n"; !strings.Contains(wire.String(), wantType) {
+		t.Errorf("headers = %q, want %q", wire, wantType)
 	}
 	b, _ := io.ReadAll(req.Body)
 	got := string(b)
@@ -663,8 +690,12 @@ func TestAddPortMappingGivesUpAfterOneRetry(t *testing.T) {
 	}
 }
 
-// A zero NewEnabled asks for a disabled mapping. miniupnpd ignores the argument,
-// but a stack that honours it answers 200 and forwards nothing.
+// The zero value must not ask for something dangerous or useless. External port
+// 0 is a wildcard that older miniupnpd routers honoured by forwarding every
+// external port (Tailscale advisory TS-2023-006). Lease 0 is permanent on IGDv1,
+// and the readme's wiki recommends 3600. NewEnabled 0 asks for a disabled
+// mapping: miniupnpd ignores it, but a stack that honours it answers 200 and
+// forwards nothing.
 func TestAddPortMappingDefaults(t *testing.T) {
 	body := make(chan string, 2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -675,21 +706,53 @@ func TestAddPortMappingDefaults(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
-	if _, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewInternalPort: 80}); err != nil {
+	if _, err := c.AddPortMapping(AddPortMappingRequest{NewInternalPort: 80}); err != nil {
 		t.Fatal(err)
 	}
 	got := <-body
-	if !strings.Contains(got, "<NewInternalClient>10.0.0.5</NewInternalClient>") {
-		t.Errorf("want LocalIP filled in as the internal client: %s", got)
+	for _, want := range []string{
+		"<NewExternalPort>80</NewExternalPort>",
+		"<NewInternalClient>10.0.0.5</NewInternalClient>",
+		"<NewEnabled>1</NewEnabled>",
+		"<NewLeaseDuration>3600</NewLeaseDuration>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %s in %s", want, got)
+		}
 	}
-	if !strings.Contains(got, "<NewEnabled>1</NewEnabled>") {
-		t.Errorf("want a zero NewEnabled sent as 1: %s", got)
+	if _, err := c.AddPortMapping(AddPortMappingRequest{}); err == nil {
+		t.Error("want an error rather than a request for external port 0")
 	}
 	if _, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewInternalClient: "10.0.0.9"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := <-body; !strings.Contains(got, "<NewInternalClient>10.0.0.9</NewInternalClient>") {
 		t.Errorf("an explicit internal client must win: %s", got)
+	}
+}
+
+// Some routers reject a lower-case protocol (tailscale/tailscale#7377), and
+// miniupnpc and libtorrent both send it upper-case.
+func TestProtocolUpperCase(t *testing.T) {
+	body := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body <- string(b)
+		io.WriteString(w, respHead+respTail)
+	}))
+	defer srv.Close()
+
+	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
+	if _, err := c.AddPortMapping(AddPortMappingRequest{NewInternalPort: 80, NewProtocol: "tcp"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DeletePortMapping(DeletePortMappingRequest{NewExternalPort: 80, NewProtocol: "udp"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"<NewProtocol>TCP</NewProtocol>", "<NewProtocol>UDP</NewProtocol>"} {
+		if got := <-body; !strings.Contains(got, want) {
+			t.Errorf("want %s in %s", want, got)
+		}
 	}
 }
 

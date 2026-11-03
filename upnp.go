@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 )
@@ -75,21 +76,36 @@ func upnpService(headers []http.Header) (service, error) {
 	return service{}, errors.Join(errs...)
 }
 
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
 func connectedService(candidates []service) (service, bool) {
+	private := []service{}
 	for _, s := range candidates {
 		res, err := (&Client{service: s}).GetExternalIPAddress()
 		if err != nil {
 			continue
 		}
-		if ip := res.NewExternalIPAddress; ip != "" && ip != "0.0.0.0" {
+		ip, err := netip.ParseAddr(strings.TrimSpace(res.NewExternalIPAddress))
+		if err != nil || !ip.IsGlobalUnicast() {
+			continue
+		}
+		if !ip.IsPrivate() && !sharedAddressSpace.Contains(ip) {
 			return s, true
 		}
+		private = append(private, s)
 	}
-	return service{}, false
+	if len(private) == 0 {
+		return service{}, false
+	}
+	return private[0], true
 }
 
 func discover(localIP string) ([]http.Header, error) {
-	devices, err := udpRequest(localIP, "239.255.255.250", 1900, []byte(mSearch))
+	payloads := [][]byte{}
+	for _, st := range ssdpTargets {
+		payloads = append(payloads, mSearch(st))
+	}
+	devices, err := udpRequest(localIP, "239.255.255.250", 1900, payloads)
 	if err != nil {
 		return nil, err
 	}
@@ -214,35 +230,48 @@ func getConnectionService(location string, rootDevice device) ([]service, error)
 }
 
 func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingResponse, error) {
+	if msg.NewExternalPort == 0 {
+		msg.NewExternalPort = msg.NewInternalPort
+	}
+	if msg.NewExternalPort == 0 {
+		return AddPortMappingResponse{}, errors.New("AddPortMapping: no port given")
+	}
 	if msg.NewInternalClient == "" {
 		msg.NewInternalClient = c.LocalIP
 	}
 	if msg.NewEnabled == 0 {
 		msg.NewEnabled = 1
 	}
+	if msg.NewLeaseDuration == 0 {
+		msg.NewLeaseDuration = 3600
+	}
+	msg.NewProtocol = strings.ToUpper(msg.NewProtocol)
 	msg.XMLNS = c.service.ServiceType
-	req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
-	if err != nil {
-		return AddPortMappingResponse{}, err
+	for {
+		req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
+		if err != nil {
+			return AddPortMappingResponse{}, err
+		}
+		res, err := doRequest(addPortMapping, req)
+		var upnpErr *Error
+		if errors.As(err, &upnpErr) && upnpErr.Code == ErrOnlyPermanentLease && msg.NewLeaseDuration != 0 {
+			msg.NewLeaseDuration = 0
+			continue
+		}
+		if err != nil {
+			return AddPortMappingResponse{}, err
+		}
+		out := AddPortMappingResponse{}
+		if res.Body.AddPortMappingResponse != nil {
+			out = *res.Body.AddPortMappingResponse
+		}
+		out.LeaseDuration = msg.NewLeaseDuration
+		return out, nil
 	}
-	res, err := doRequest(addPortMapping, req)
-	var upnpErr *Error
-	if errors.As(err, &upnpErr) && upnpErr.Code == ErrOnlyPermanentLease && msg.NewLeaseDuration != 0 {
-		msg.NewLeaseDuration = 0
-		return c.AddPortMapping(msg)
-	}
-	if err != nil {
-		return AddPortMappingResponse{}, err
-	}
-	out := AddPortMappingResponse{}
-	if res.Body.AddPortMappingResponse != nil {
-		out = *res.Body.AddPortMappingResponse
-	}
-	out.LeaseDuration = msg.NewLeaseDuration
-	return out, nil
 }
 
 func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
+	msg.NewProtocol = strings.ToUpper(msg.NewProtocol)
 	msg.XMLNS = c.service.ServiceType
 	req, err := newEnvelopeReq(deletePortMapping, c.service, &msg)
 	if err != nil {
