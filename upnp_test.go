@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -113,33 +114,31 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
-// net/http cannot serialize a non-HTTP method to "*", so the datagram is hand
-// built and its shape is entirely on us.
-func TestHTTPRequest(t *testing.T) {
-	got := string(httpRequest(http.Request{
-		Method: "M-SEARCH",
-		Header: http.Header{"ST": []string{"ssdp:all"}, "MX": []string{"5"}},
-	}))
-	if !strings.HasPrefix(got, "M-SEARCH * HTTP/1.1\r\n") {
-		t.Errorf("bad request line: %q", got)
+// net/http cannot serialize a non-HTTP method to "*", so the datagram is a
+// literal. Built from a map, its header order changed from run to run, and all
+// three retransmits share one payload, so an order-sensitive SSDP stack would
+// fail whole New() calls at random.
+func TestMSearch(t *testing.T) {
+	if !strings.HasPrefix(mSearch, "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n") {
+		t.Errorf("request line then HOST must lead: %q", mSearch)
 	}
-	if !strings.HasSuffix(got, "\r\n\r\n") {
-		t.Errorf("headers must end with a blank line: %q", got)
+	if !strings.HasSuffix(mSearch, "\r\n\r\n") {
+		t.Errorf("headers must end with a blank line: %q", mSearch)
 	}
-	for _, want := range []string{"ST: ssdp:all\r\n", "MX: 5\r\n", "USER-AGENT: "} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in %q", want, got)
+	for _, want := range []string{"\r\nMAN: \"ssdp:discover\"\r\n", "\r\nMX: 5\r\n", "\r\nST: ssdp:all\r\n", "\r\nUSER-AGENT: "} {
+		if !strings.Contains(mSearch, want) {
+			t.Errorf("missing %q in %q", want, mSearch)
 		}
-	}
-	// Header.Set would canonicalize these to St/Mx; SSDP wants them uppercase.
-	if strings.Contains(got, "St:") || strings.Contains(got, "Mx:") {
-		t.Errorf("header casing was canonicalized: %q", got)
 	}
 }
 
 func ssdpOK(location string) []byte {
+	return ssdpST(location, "upnp:rootdevice")
+}
+
+func ssdpST(location, st string) []byte {
 	return []byte("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: " + location +
-		"\r\nST: upnp:rootdevice\r\nUSN: uuid:1::upnp:rootdevice\r\n\r\n")
+		"\r\nST: " + st + "\r\nUSN: uuid:1::" + st + "\r\n\r\n")
 }
 
 // One device answers ssdp:all once per service, and the M-SEARCH goes out three
@@ -171,11 +170,44 @@ func TestParseSSDP(t *testing.T) {
 	}
 }
 
+// ssdp:all makes every UPnP device on the LAN answer, in random order, and each
+// one ahead of the router costs a description plus every SCPD, or 10s if it
+// stalls. A router's first reply is often the generic upnp:rootdevice, so its
+// IGD search target can arrive after its LOCATION was already seen.
+func TestParseSSDPGatewayFirst(t *testing.T) {
+	got, err := parseSSDP([][]byte{
+		ssdpOK("http://10.0.0.7/tv.xml"),
+		ssdpOK("http://10.0.0.1/igd.xml"),
+		ssdpST("http://10.0.0.8/nas.xml", "urn:schemas-upnp-org:device:MediaServer:1"),
+		ssdpST("http://10.0.0.1/igd.xml", "urn:schemas-upnp-org:device:InternetGatewayDevice:1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := []string{}
+	for _, h := range got {
+		order = append(order, h.Get("LOCATION"))
+	}
+	want := []string{"http://10.0.0.1/igd.xml", "http://10.0.0.7/tv.xml", "http://10.0.0.8/nas.xml"}
+	if !slices.Equal(order, want) {
+		t.Errorf("order = %v, want %v", order, want)
+	}
+}
+
+// net/http accepts a status line with no reason phrase; discovery must not be
+// stricter than the stdlib.
+func TestParseSSDPWithoutReasonPhrase(t *testing.T) {
+	got, err := parseSSDP([][]byte{[]byte("HTTP/1.1 200\r\nLOCATION: http://10.0.0.1/desc.xml\r\n\r\n")})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v err=%v, want the reply accepted", got, err)
+	}
+}
+
 // A dropped M-SEARCH is indistinguishable from a router without UPnP, so the
 // datagram goes out more than once.
 func TestUDPRequestRetransmits(t *testing.T) {
 	if testing.Short() {
-		t.Skip("waits out the 5s read deadline")
+		t.Skip("waits out the 6.5s ssdp deadline")
 	}
 	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -227,7 +259,9 @@ func TestGetLocalIPAddr(t *testing.T) {
 }
 
 // Router firmware emits sloppy XML. Rejecting a device over a bare ampersand in
-// its friendlyName loses a router that otherwise works fine.
+// its friendlyName loses a router that otherwise works fine. encoding/xml also
+// refuses any non-UTF-8 declaration outright, and passing the bytes through
+// instead fails on the first latin-1 byte as invalid UTF-8.
 func TestDeviceDescriptionTolerance(t *testing.T) {
 	svc := `<serviceList><service><serviceType>urn:x:WANIPConnection:1</serviceType><SCPDURL>/scpd.xml</SCPDURL><controlURL>/ctl</controlURL></service></serviceList>`
 	cases := map[string]string{
@@ -235,6 +269,7 @@ func TestDeviceDescriptionTolerance(t *testing.T) {
 		"undefined entity": `<?xml version="1.0"?><root><device><friendlyName>R&nbsp;D</friendlyName>` + svc + `</device></root>`,
 		"truncated":        `<?xml version="1.0"?><root><device>` + svc + `</device>`,
 		"well formed":      `<?xml version="1.0"?><root><device>` + svc + `</device></root>`,
+		"latin-1":          "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root><device><friendlyName>Telef\xf3nica</friendlyName>" + svc + "</device></root>",
 	}
 	for name, body := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -304,7 +339,9 @@ func TestServiceActions(t *testing.T) {
 
 // A service advertising only GetExternalIPAddress must not beat one that also
 // does AddPortMapping, wherever it sits in the device tree. Routers with a
-// partial action list are still kept as a candidate rather than rejected.
+// partial action list are still kept as a candidate rather than rejected, and
+// so is a WAN connection whose SCPD 404s: miniupnpc never reads the SCPD, so a
+// router can ship a broken one and still work everywhere else. It ranks last.
 func TestGetConnectionServiceRanksAndRecurses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -320,6 +357,7 @@ func TestGetConnectionServiceRanksAndRecurses(t *testing.T) {
 
 	root := device{
 		ServiceList: []service{
+			{ServiceType: "urn:x:WANPPPConnection:1", SCPDURL: "/nope.xml"},
 			{ServiceType: "partial", SCPDURL: "/partial.xml"},
 			{ServiceType: "unrelated", SCPDURL: "/nope.xml"},
 		},
@@ -330,16 +368,19 @@ func TestGetConnectionServiceRanksAndRecurses(t *testing.T) {
 
 	got, err := getConnectionService(srv.URL, root)
 	if err == nil {
-		t.Error("want the 404 on /nope.xml reported as a diagnostic error")
+		t.Error("want the 404s on /nope.xml reported as a diagnostic error")
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d services, want 2 (the partial one is kept)", len(got))
+	if len(got) != 3 {
+		t.Fatalf("got %d services, want 3 (partial and WAN kept, unrelated dropped)", len(got))
 	}
 	if got[0].ServiceType != "full" {
 		t.Errorf("first = %q, want the nested full service", got[0].ServiceType)
 	}
 	if len(got[0].Actions) != 3 {
 		t.Errorf("actions = %v, want all three recorded", got[0].Actions)
+	}
+	if got[2].ServiceType != "urn:x:WANPPPConnection:1" {
+		t.Errorf("last = %q, want the WAN service whose SCPD failed", got[2].ServiceType)
 	}
 }
 
@@ -418,6 +459,34 @@ func TestUpnpServiceSkipsBadDevices(t *testing.T) {
 	}
 }
 
+// Router UPnP off, and every device that answered has no services at all. Each
+// one contributed a nil error, errors.Join returned nil, and New handed back a
+// client whose first call failed with `Post "": unsupported protocol scheme`.
+func TestUpnpServiceErrorsWithoutServices(t *testing.T) {
+	srv := fakeRouter(t)
+	if s, err := upnpService([]http.Header{location(srv.URL)}); err == nil {
+		t.Errorf("got %+v and no error, want an error", s)
+	}
+}
+
+// Router traffic never leaves the LAN. On http.DefaultTransport it followed
+// HTTP_PROXY, which does not exempt private addresses, so on a machine with a
+// proxy configured the description fetch went to the proxy instead of the
+// router. Keep-alive is off to match miniupnpc's one request per connection;
+// otherwise discovery holds an idle connection to every device it probed.
+func TestHTTPClientTransport(t *testing.T) {
+	tr, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want a dedicated *http.Transport", httpClient.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Error("router traffic must not go through a proxy")
+	}
+	if !tr.DisableKeepAlives {
+		t.Error("keep-alive must be off")
+	}
+}
+
 // Routers with a strict SOAP parser reject the envelope encoding/xml produces
 // from a struct, so the prefixes here are load-bearing.
 func TestEnvelope(t *testing.T) {
@@ -485,6 +554,22 @@ func TestFaultIsTyped(t *testing.T) {
 	}
 }
 
+// A fault is a failure whatever the status line says. Checking for it only on
+// non-200 replies reported a refused mapping as created.
+func TestFaultInOKResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, faultResp("718"))
+	}))
+	defer srv.Close()
+
+	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
+	_, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewProtocol: "TCP"})
+	var upnpErr *Error
+	if !errors.As(err, &upnpErr) || upnpErr.Code != ErrConflictInMappingEntry {
+		t.Errorf("want *Error %d, got %v", ErrConflictInMappingEntry, err)
+	}
+}
+
 // Not every 500 carries a fault we can decode, and that must still be an error.
 func TestNonFaultFailures(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -509,8 +594,23 @@ func TestNonFaultFailures(t *testing.T) {
 	}
 }
 
+// SOAP replies come from the same firmware as the description and get the same
+// tolerance, latin-1 declaration included.
+func TestSOAPResponseLatin1(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, strings.Replace(extIPResp("88.1.2.3"), `<?xml version="1.0"?>`, `<?xml version="1.0" encoding="ISO-8859-1"?>`, 1))
+	}))
+	defer srv.Close()
+
+	c := &Client{service: service{Location: srv.URL, ControlURL: "/ctl"}}
+	if ip, err := c.GetExternalIPAddress(); err != nil || ip.NewExternalIPAddress != "88.1.2.3" {
+		t.Errorf("GetExternalIPAddress = %+v err=%v", ip, err)
+	}
+}
+
 // 725 means the router only does permanent mappings, so the lease must drop to
-// 0 and the call be retried rather than reported as a failure.
+// 0 and the call be retried rather than reported as a failure. The caller asked
+// for a lease and got a mapping that outlives a crash, so the response says so.
 func TestAddPortMappingRetriesPermanentLease(t *testing.T) {
 	leases := []string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -530,10 +630,14 @@ func TestAddPortMappingRetriesPermanentLease(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{LocalIP: "10.0.0.5", service: service{Location: srv.URL, ControlURL: "/ctl"}}
-	if _, err := c.AddPortMapping(AddPortMappingRequest{
+	res, err := c.AddPortMapping(AddPortMappingRequest{
 		NewExternalPort: 80, NewInternalPort: 80, NewProtocol: "TCP", NewEnabled: 1, NewLeaseDuration: 3600,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("want retry to succeed, got %v", err)
+	}
+	if res.LeaseDuration != 0 {
+		t.Errorf("LeaseDuration = %d, want 0 so the caller knows the mapping is permanent", res.LeaseDuration)
 	}
 	if len(leases) != 2 || leases[0] != "nonzero" || leases[1] != "0" {
 		t.Errorf("calls = %v, want [nonzero 0]", leases)
@@ -559,7 +663,9 @@ func TestAddPortMappingGivesUpAfterOneRetry(t *testing.T) {
 	}
 }
 
-func TestAddPortMappingDefaultsInternalClient(t *testing.T) {
+// A zero NewEnabled asks for a disabled mapping. miniupnpd ignores the argument,
+// but a stack that honours it answers 200 and forwards nothing.
+func TestAddPortMappingDefaults(t *testing.T) {
 	body := make(chan string, 2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -572,8 +678,12 @@ func TestAddPortMappingDefaultsInternalClient(t *testing.T) {
 	if _, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewInternalPort: 80}); err != nil {
 		t.Fatal(err)
 	}
-	if got := <-body; !strings.Contains(got, "<NewInternalClient>10.0.0.5</NewInternalClient>") {
+	got := <-body
+	if !strings.Contains(got, "<NewInternalClient>10.0.0.5</NewInternalClient>") {
 		t.Errorf("want LocalIP filled in as the internal client: %s", got)
+	}
+	if !strings.Contains(got, "<NewEnabled>1</NewEnabled>") {
+		t.Errorf("want a zero NewEnabled sent as 1: %s", got)
 	}
 	if _, err := c.AddPortMapping(AddPortMappingRequest{NewExternalPort: 80, NewInternalClient: "10.0.0.9"}); err != nil {
 		t.Fatal(err)
@@ -609,10 +719,10 @@ func TestClientOperations(t *testing.T) {
 	if err != nil || ip.NewExternalIPAddress != "88.1.2.3" {
 		t.Errorf("GetExternalIPAddress = %+v err=%v", ip, err)
 	}
-	if _, err := c.AddPortMapping(AddPortMappingRequest{
-		NewExternalPort: 8080, NewInternalPort: 8080, NewProtocol: "TCP", NewEnabled: 1,
-	}); err != nil {
-		t.Errorf("AddPortMapping: %v", err)
+	if res, err := c.AddPortMapping(AddPortMappingRequest{
+		NewExternalPort: 8080, NewInternalPort: 8080, NewProtocol: "TCP", NewEnabled: 1, NewLeaseDuration: 3600,
+	}); err != nil || res.LeaseDuration != 3600 {
+		t.Errorf("AddPortMapping = %+v err=%v, want the requested lease reported", res, err)
 	}
 	if _, err := c.DeletePortMapping(DeletePortMappingRequest{
 		NewExternalPort: 8080, NewProtocol: "TCP",

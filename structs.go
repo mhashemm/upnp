@@ -19,48 +19,29 @@ type Client struct {
 	service service
 }
 
-type specVersion struct {
-	XMLName xml.Name `xml:"specVersion"`
-	Major   int      `xml:"major"`
-	Minor   int      `xml:"minor"`
-}
 type service struct {
 	XMLName     xml.Name `xml:"service"`
 	ServiceType string   `xml:"serviceType"`
-	ServiceId   string   `xml:"serviceId"`
 	ControlURL  string   `xml:"controlURL"`
-	EventSubURL string   `xml:"eventSubURL"`
 	SCPDURL     string   `xml:"SCPDURL"`
 	Location    string   `xml:"-"`
 	Actions     []string `xml:"-"`
 }
 type device struct {
-	XMLName      xml.Name  `xml:"device"`
-	DeviceType   string    `xml:"deviceType"`
-	SerialNumber string    `xml:"serialNumber"`
-	UDN          string    `xml:"UDN"`
-	ServiceList  []service `xml:"serviceList>service"`
-	DeviceList   []device  `xml:"deviceList>device"`
+	XMLName     xml.Name  `xml:"device"`
+	ServiceList []service `xml:"serviceList>service"`
+	DeviceList  []device  `xml:"deviceList>device"`
 }
 
 type root struct {
-	XMLName     xml.Name    `xml:"root"`
-	XMLNS       string      `xml:"xmlns,attr"`
-	SpecVersion specVersion `xml:"specVersion"`
-	Device      device      `xml:"device"`
-	BaseUrl     string      `xml:"URLBase"`
+	XMLName xml.Name `xml:"root"`
+	Device  device   `xml:"device"`
+	BaseUrl string   `xml:"URLBase"`
 }
 
-type argument struct {
-	XMLName              xml.Name `xml:"argument"`
-	Name                 string   `xml:"name"`
-	Direction            string   `xml:"direction"`
-	RelatedStateVariable string   `xml:"relatedStateVariable"`
-}
 type action struct {
-	XMLName      xml.Name   `xml:"action"`
-	Name         string     `xml:"name"`
-	ArgumentList []argument `xml:"argumentList>argument"`
+	XMLName xml.Name `xml:"action"`
+	Name    string   `xml:"name"`
 }
 type description struct {
 	XMLName    xml.Name `xml:"scpd"`
@@ -68,18 +49,16 @@ type description struct {
 }
 
 type envelope struct {
-	XMLNS         string   `xml:"xmlns:s,attr"`
-	XMLName       xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Envelope"`
-	EncodingStyle string   `xml:"http://schemas.xmlsoap.org/soap/envelope/ encodingStyle,attr"`
-	Body          body     `xml:"http://schemas.xmlsoap.org/soap/envelope/ Body"`
+	XMLName xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Envelope"`
+	Body    body     `xml:"http://schemas.xmlsoap.org/soap/envelope/ Body"`
 }
 
 type body struct {
-	Fault *fault `xml:"Fault,omitempty"`
+	Fault *fault `xml:"Fault"`
 
-	AddPortMappingResponse       *AddPortMappingResponse       `xml:"AddPortMappingResponse,omitempty"`
-	DeletePortMappingResponse    *DeletePortMappingResponse    `xml:"DeletePortMappingResponse,omitempty"`
-	GetExternalIPAddressResponse *GetExternalIPAddressResponse `xml:"GetExternalIPAddressResponse,omitempty"`
+	AddPortMappingResponse       *AddPortMappingResponse       `xml:"AddPortMappingResponse"`
+	DeletePortMappingResponse    *DeletePortMappingResponse    `xml:"DeletePortMappingResponse"`
+	GetExternalIPAddressResponse *GetExternalIPAddressResponse `xml:"GetExternalIPAddressResponse"`
 }
 
 type fault struct {
@@ -129,10 +108,12 @@ type GetExternalIPAddressRequest struct {
 	XMLNS   string   `xml:"xmlns:u,attr"`
 }
 
-type AddPortMappingResponse struct{}
+type AddPortMappingResponse struct {
+	LeaseDuration int `xml:"-"`
+}
 
 type DeletePortMappingResponse struct{}
 
 type GetExternalIPAddressResponse struct {
-	NewExternalIPAddress string `xml:"NewExternalIPAddress,omitempty"`
+	NewExternalIPAddress string `xml:"NewExternalIPAddress"`
 }

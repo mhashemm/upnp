@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
+var httpClient = &http.Client{
+	Timeout:   10 * time.Second,
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
 
 const (
 	ssdpMX       = 5 * time.Second
@@ -22,12 +27,32 @@ const (
 	ssdpMargin   = 500 * time.Millisecond
 )
 
+var mSearch = "M-SEARCH * HTTP/1.1\r\n" +
+	"HOST: 239.255.255.250:1900\r\n" +
+	"MAN: \"ssdp:discover\"\r\n" +
+	"MX: " + strconv.Itoa(int(ssdpMX/time.Second)) + "\r\n" +
+	"ST: ssdp:all\r\n" +
+	"USER-AGENT: Golang/" + strings.TrimPrefix(runtime.Version(), "go") + " UPnP/1.1 Upnp/1.0\r\n" +
+	"\r\n"
+
 func decodeXML(b []byte, v any) error {
 	d := xml.NewDecoder(bytes.NewReader(b))
 	d.Strict = false
 	d.Entity = xml.HTMLEntity
-	d.AutoClose = xml.HTMLAutoClose
+	d.CharsetReader = latin1
 	return d.Decode(v)
+}
+
+func latin1(_ string, r io.Reader) (io.Reader, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	u := make([]rune, len(b))
+	for i, c := range b {
+		u[i] = rune(c)
+	}
+	return strings.NewReader(string(u)), nil
 }
 
 func resolveURL(base, ref string) (string, error) {
@@ -40,18 +65,6 @@ func resolveURL(base, ref string) (string, error) {
 		return "", fmt.Errorf("invalid url %q: %w", ref, err)
 	}
 	return b.ResolveReference(r).String(), nil
-}
-
-func httpRequest(r http.Request) []byte {
-	r.Header["USER-AGENT"] = []string{"Golang/1.23.3 UPnP/1.1 Upnp/1.0"}
-	b := bytes.NewBuffer(nil)
-	b.WriteString(r.Method)
-	b.WriteString(" * HTTP/1.1\r\n")
-	for k, v := range r.Header {
-		b.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, "; ")))
-	}
-	b.WriteString("\r\n")
-	return b.Bytes()
 }
 
 func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, error) {
@@ -103,7 +116,7 @@ func udpRequest(localIP, remoteIP string, port int, payload []byte) ([][]byte, e
 		res = append(res, received[:n])
 	}
 	if len(res) == 0 {
-		return nil, fmt.Errorf("%s:%d no content, with error: %s", remoteIP, port, resErr)
+		return nil, fmt.Errorf("%s:%d no content, with error: %w", remoteIP, port, resErr)
 	}
 	return res, nil
 }
@@ -147,16 +160,15 @@ func doRequest(action string, req *http.Request) (envelope, error) {
 		return envelope{}, err
 	}
 	envelopeRes := envelope{}
-	unmarshalErr := xml.Unmarshal(resBody, &envelopeRes)
+	decodeErr := decodeXML(resBody, &envelopeRes)
+	if f := envelopeRes.Body.Fault; f != nil {
+		return envelope{}, &Error{Action: action, Code: f.Code, Description: f.Description}
+	}
 	if res.StatusCode != http.StatusOK {
-		if unmarshalErr == nil && envelopeRes.Body.Fault != nil {
-			f := envelopeRes.Body.Fault
-			return envelope{}, &Error{Action: action, Code: f.Code, Description: f.Description}
-		}
 		return envelope{}, fmt.Errorf("%s: not ok: %s: %s", action, res.Status, resBody)
 	}
-	if unmarshalErr != nil {
-		return envelope{}, unmarshalErr
+	if decodeErr != nil {
+		return envelope{}, decodeErr
 	}
 	return envelopeRes, nil
 }

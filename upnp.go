@@ -8,10 +8,8 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/textproto"
 	"slices"
-	"strconv"
-	"time"
+	"strings"
 )
 
 func New() (*Client, error) {
@@ -42,7 +40,6 @@ func GetLocalIPAddr() string {
 		return ""
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Unix(0, 0))
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
@@ -61,6 +58,9 @@ func upnpService(headers []http.Header) (service, error) {
 		}
 		candidates, err := getConnectionService(base, dd.Device)
 		if len(candidates) == 0 {
+			if err == nil {
+				err = fmt.Errorf("%s: no port mapping service", header.Get("LOCATION"))
+			}
 			errs = append(errs, err)
 			continue
 		}
@@ -89,16 +89,7 @@ func connectedService(candidates []service) (service, bool) {
 }
 
 func discover(localIP string) ([]http.Header, error) {
-	header := http.Header{}
-	header["HOST"] = []string{"239.255.255.250:1900"}
-	header["ST"] = []string{"ssdp:all"}
-	header["MAN"] = []string{"\"ssdp:discover\""}
-	header["MX"] = []string{strconv.Itoa(int(ssdpMX / time.Second))}
-	req := http.Request{
-		Method: "M-SEARCH",
-		Header: header,
-	}
-	devices, err := udpRequest(localIP, "239.255.255.250", 1900, httpRequest(req))
+	devices, err := udpRequest(localIP, "239.255.255.250", 1900, []byte(mSearch))
 	if err != nil {
 		return nil, err
 	}
@@ -109,39 +100,38 @@ func parseSSDP(devices [][]byte) ([]http.Header, error) {
 	headers := []http.Header{}
 	errs := []error{}
 	seen := map[string]bool{}
-	for _, res := range devices {
-		httpRes, headerRes, found := bytes.Cut(res, []byte{'\n'})
-		if !found {
-			errs = append(errs, fmt.Errorf("invalid response: %s\n", res))
-			continue
-		}
-		s := bytes.Split(httpRes, []byte{' '})
-		if len(s) < 3 {
-			errs = append(errs, fmt.Errorf("invalid response: %s\n", headerRes))
-			continue
-		}
-		statusCode := string(s[1])
-		if statusCode != strconv.Itoa(http.StatusOK) {
-			errs = append(errs, fmt.Errorf("not ok: %s\n", headerRes))
-			continue
-		}
-		_header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerRes))).ReadMIMEHeader()
+	rank := map[string]int{}
+	for _, b := range devices {
+		res, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(b)), nil)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("invalid ssdp reply %q: %w", b, err))
 			continue
 		}
-		header := http.Header(_header)
-		location := header.Get("LOCATION")
+		if res.StatusCode != http.StatusOK {
+			errs = append(errs, fmt.Errorf("ssdp reply not ok: %s", res.Status))
+			continue
+		}
+		location := res.Header.Get("LOCATION")
+		if st := res.Header.Get("ST"); strings.Contains(st, "InternetGatewayDevice") || wanConnection(st) {
+			rank[location] = -1
+		}
 		if seen[location] {
 			continue
 		}
 		seen[location] = true
-		headers = append(headers, header)
+		headers = append(headers, res.Header)
 	}
 	if len(headers) == 0 {
 		return nil, errors.Join(errs...)
 	}
+	slices.SortStableFunc(headers, func(a, b http.Header) int {
+		return rank[a.Get("LOCATION")] - rank[b.Get("LOCATION")]
+	})
 	return headers, nil
+}
+
+func wanConnection(s string) bool {
+	return strings.Contains(s, "WANIPConnection") || strings.Contains(s, "WANPPPConnection")
 }
 
 func deviceDescription(header http.Header) (root, error) {
@@ -180,7 +170,7 @@ func serviceActions(s service) ([]string, error) {
 		return nil, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s responed with status=%d body=[%s]", url, res.StatusCode, body)
+		return nil, fmt.Errorf("%s responded with status=%d body=[%s]", url, res.StatusCode, body)
 	}
 	desc := description{}
 	if err := decodeXML(body, &desc); err != nil && len(desc.ActionList) == 0 {
@@ -207,7 +197,9 @@ func getConnectionService(location string, rootDevice device) ([]service, error)
 		actions, err := serviceActions(s)
 		if err != nil {
 			errs = append(errs, err)
-			continue
+			if !wanConnection(s.ServiceType) {
+				continue
+			}
 		}
 		s.Actions = actions
 		services = append(services, s)
@@ -225,6 +217,9 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 	if msg.NewInternalClient == "" {
 		msg.NewInternalClient = c.LocalIP
 	}
+	if msg.NewEnabled == 0 {
+		msg.NewEnabled = 1
+	}
 	msg.XMLNS = c.service.ServiceType
 	req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
 	if err != nil {
@@ -239,10 +234,12 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 	if err != nil {
 		return AddPortMappingResponse{}, err
 	}
-	if res.Body.AddPortMappingResponse == nil {
-		return AddPortMappingResponse{}, nil
+	out := AddPortMappingResponse{}
+	if res.Body.AddPortMappingResponse != nil {
+		out = *res.Body.AddPortMappingResponse
 	}
-	return *res.Body.AddPortMappingResponse, nil
+	out.LeaseDuration = msg.NewLeaseDuration
+	return out, nil
 }
 
 func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
