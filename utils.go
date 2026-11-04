@@ -2,7 +2,9 @@ package upnp
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,14 +35,27 @@ func info(msg string, args ...any) {
 var httpClient = &http.Client{
 	Timeout:   10 * time.Second,
 	Transport: &http.Transport{DisableKeepAlives: true},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxRedirects {
+			return errors.New("too many redirects")
+		}
+		if req.URL.Hostname() != via[0].URL.Hostname() {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
 }
 
 const (
-	ssdpMX       = 5 * time.Second
-	ssdpRetries  = 2
-	ssdpRetryGap = 500 * time.Millisecond
-	ssdpMargin   = 500 * time.Millisecond
-	ssdpWait     = ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin
+	ssdpMX           = 5 * time.Second
+	ssdpRetries      = 2
+	ssdpRetryGap     = 500 * time.Millisecond
+	ssdpMargin       = 500 * time.Millisecond
+	ssdpWait         = ssdpRetryGap*ssdpRetries + ssdpMX + ssdpMargin
+	discoveryTimeout = ssdpWait + 30*time.Second
+	maxReplies       = 4096
+	maxBody          = 1 << 20
+	maxRedirects     = 3
 )
 
 var ssdpTargets = []string{
@@ -88,6 +103,43 @@ func snippet(b []byte) string {
 	return fmt.Sprintf("%s... (%d more bytes)", b[:512], len(b)-512)
 }
 
+func readBody(r io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, maxBody))
+}
+
+func get(c context.Context, url string) ([]byte, *http.Response, error) {
+	req, err := http.NewRequestWithContext(c, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+	body, err := readBody(res.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("GET %s: %s: %s", url, res.Status, snippet(body))
+	}
+	return body, res, nil
+}
+
+func sameHost(base, ref string) bool {
+	resolved, err := resolveURL(base, ref)
+	if err != nil {
+		return false
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	r, err := url.Parse(resolved)
+	return err == nil && b.Hostname() == r.Hostname()
+}
+
 func resolveURL(base, ref string) (string, error) {
 	b, err := url.Parse(base)
 	if err != nil {
@@ -100,7 +152,9 @@ func resolveURL(base, ref string) (string, error) {
 	return b.ResolveReference(r).String(), nil
 }
 
-func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([]datagram, error) {
+func udpRequest(c context.Context, localIP, remoteIP string, port int, payloads [][]byte, retryGap, wait time.Duration) ([]datagram, error) {
+	c, cancel := context.WithCancel(c)
+	defer cancel()
 	local, err := netip.ParseAddr(localIP)
 	if err != nil {
 		return nil, err
@@ -128,30 +182,36 @@ func udpRequest(localIP, remoteIP string, port int, payloads [][]byte) ([]datagr
 	}
 	go func() {
 		for range ssdpRetries {
-			time.Sleep(ssdpRetryGap)
+			select {
+			case <-time.After(retryGap):
+			case <-c.Done():
+				return
+			}
 			for _, p := range payloads {
 				socket.WriteToUDP(p, remote)
 			}
 		}
 	}()
-	deadline := time.Now().Add(ssdpWait)
+	err = socket.SetReadDeadline(time.Now().Add(wait))
+	if err != nil {
+		return nil, err
+	}
+	defer context.AfterFunc(c, func() { socket.SetReadDeadline(time.Now()) })()
 	res := []datagram{}
+	received := make([]byte, 4096)
 	var resErr error
-	for {
-		received := make([]byte, 4096)
-		err := socket.SetReadDeadline(deadline)
-		if err != nil {
-			resErr = err
-			break
-		}
+	for len(res) < maxReplies {
 		n, from, err := socket.ReadFromUDPAddrPort(received)
 		if err != nil {
 			resErr = err
 			break
 		}
-		res = append(res, datagram{from: from, data: received[:n]})
+		res = append(res, datagram{from: from, data: bytes.Clone(received[:n])})
 	}
 	if len(res) == 0 {
+		if err := c.Err(); err != nil {
+			resErr = err
+		}
 		return nil, fmt.Errorf("%s:%d: %w", remoteIP, port, resErr)
 	}
 	return res, nil
@@ -162,7 +222,7 @@ const (
 	envelopeClose = `</s:Body></s:Envelope>`
 )
 
-func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
+func newEnvelopeReq(c context.Context, action string, s service, msg any) (*http.Request, error) {
 	url, err := resolveURL(s.Location, s.ControlURL)
 	if err != nil {
 		return nil, err
@@ -177,7 +237,7 @@ func newEnvelopeReq(action string, s service, msg any) (*http.Request, error) {
 	buf.WriteString(envelopeClose)
 	soapAction := fmt.Sprintf("\"%s#%s\"", s.ServiceType, action)
 	debug("soap request", "action", action, "url", url, "soapaction", soapAction, "body", buf.String())
-	req, err := http.NewRequest(http.MethodPost, url, buf)
+	req, err := http.NewRequestWithContext(c, http.MethodPost, url, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +253,7 @@ func doRequest(action string, req *http.Request) (envelope, error) {
 		return envelope{}, fmt.Errorf("%s: %w", action, err)
 	}
 	defer res.Body.Close()
-	resBody, err := io.ReadAll(res.Body)
+	resBody, err := readBody(res.Body)
 	if err != nil {
 		return envelope{}, fmt.Errorf("%s: reading the %s response: %w", action, res.Status, err)
 	}

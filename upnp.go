@@ -3,26 +3,33 @@ package upnp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 )
 
 func New() (*Client, error) {
+	return NewContext(context.Background())
+}
+
+func NewContext(c context.Context) (*Client, error) {
+	c, cancel := context.WithTimeout(c, discoveryTimeout)
+	defer cancel()
 	localIP, err := localIPAddr()
 	if err != nil {
 		return nil, fmt.Errorf("no outbound route, cannot determine the local ip: %w", err)
 	}
-	headers, err := discover(localIP)
+	headers, err := discover(c, localIP)
 	if err != nil {
 		return nil, err
 	}
-	service, err := upnpService(headers)
+	service, err := upnpService(c, headers)
 	if err != nil {
 		return nil, fmt.Errorf("no upnp gateway among the %d devices that answered:\n%w", len(headers), err)
 	}
@@ -49,22 +56,27 @@ func localIPAddr() (string, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
 
-func upnpService(headers []http.Header) (service, error) {
+func upnpService(c context.Context, headers []http.Header) (service, error) {
 	errs := []error{}
 	all := []service{}
+	private := []service{}
 	for _, header := range headers {
+		if err := c.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		location := header.Get("LOCATION")
-		dd, err := deviceDescription(header)
+		dd, err := deviceDescription(c, header)
 		if err != nil {
 			debug("device skipped", "location", location, "err", err)
 			errs = append(errs, err)
 			continue
 		}
 		base := dd.BaseUrl
-		if base == "" {
+		if base == "" || !sameHost(location, base) {
 			base = location
 		}
-		candidates, err := getConnectionService(base, dd.Device)
+		candidates, err := getConnectionService(c, base, dd.Device)
 		if len(candidates) == 0 {
 			if err == nil {
 				err = errors.New("no service offers " + strings.Join(supported, ", "))
@@ -77,11 +89,18 @@ func upnpService(headers []http.Header) (service, error) {
 		for i := range candidates {
 			candidates[i].Device = identity(dd)
 		}
-		if s, ok := connectedService(candidates); ok {
-			selected(s)
-			return s, nil
+		if s, ok := connectedService(c, candidates); ok {
+			if IPClass(s.ExternalIP) == IPPublic {
+				selected(s)
+				return s, nil
+			}
+			private = append(private, s)
 		}
 		all = append(all, candidates...)
+	}
+	if len(private) > 0 {
+		selected(private[0])
+		return private[0], nil
 	}
 	if len(all) > 0 {
 		selected(all[0])
@@ -128,7 +147,12 @@ func selected(s service) {
 		"external_ip", s.ExternalIP, "class", IPClass(s.ExternalIP))
 }
 
-var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
 
 const (
 	IPPublic   = "public"
@@ -138,20 +162,21 @@ const (
 
 func IPClass(s string) string {
 	ip, err := netip.ParseAddr(strings.TrimSpace(s))
+	ip = ip.Unmap()
 	switch {
 	case err != nil || !ip.IsGlobalUnicast():
 		return IPUnusable
-	case ip.IsPrivate() || sharedAddressSpace.Contains(ip):
+	case ip.IsPrivate() || slices.ContainsFunc(nonPublic, func(p netip.Prefix) bool { return p.Contains(ip) }):
 		return IPPrivate
 	}
 	return IPPublic
 }
 
-func connectedService(candidates []service) (service, bool) {
+func connectedService(c context.Context, candidates []service) (service, bool) {
 	private := []service{}
 	for i := range candidates {
 		s := &candidates[i]
-		res, err := (&Client{service: *s}).GetExternalIPAddress()
+		res, err := (&Client{service: *s}).externalIP(c)
 		s.ExternalIP = res.NewExternalIPAddress
 		class := IPClass(s.ExternalIP)
 		debug("wan probe", "service", s.ServiceType, "control", s.ControlURL, "external_ip", s.ExternalIP, "class", class, "err", err)
@@ -168,13 +193,13 @@ func connectedService(candidates []service) (service, bool) {
 	return private[0], true
 }
 
-func discover(localIP string) ([]http.Header, error) {
+func discover(c context.Context, localIP string) ([]http.Header, error) {
 	payloads := [][]byte{}
 	for _, st := range ssdpTargets {
 		payloads = append(payloads, mSearch(st))
 	}
 	debug("ssdp search", "local", localIP, "targets", ssdpTargets, "wait", ssdpWait)
-	devices, err := udpRequest(localIP, "239.255.255.250", 1900, payloads)
+	devices, err := udpRequest(c, localIP, "239.255.255.250", 1900, payloads, ssdpRetryGap, ssdpWait)
 	if err != nil {
 		return nil, fmt.Errorf("no ssdp reply within %s to %d searches sent %d times from %s; upnp may be off on the router, or a vpn, virtual interface or firewall is in the way: %w",
 			ssdpWait, len(ssdpTargets), ssdpRetries+1, localIP, err)
@@ -191,7 +216,7 @@ func parseSSDP(devices []datagram) ([]http.Header, error) {
 		res, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(d.data)), nil)
 		if err != nil {
 			debug("ssdp reply unreadable", "from", d.from, "err", err, "raw", string(d.data))
-			errs = append(errs, fmt.Errorf("ssdp reply from %s: %w: %q", d.from, err, d.data))
+			errs = append(errs, fmt.Errorf("ssdp reply from %s: %w: %q", d.from, err, snippet(d.data)))
 			continue
 		}
 		location := res.Header.Get("LOCATION")
@@ -203,6 +228,10 @@ func parseSSDP(devices []datagram) ([]http.Header, error) {
 		}
 		if location == "" {
 			errs = append(errs, fmt.Errorf("ssdp reply from %s has no LOCATION", d.from))
+			continue
+		}
+		if !fromItself(location, d.from.Addr()) {
+			errs = append(errs, fmt.Errorf("ssdp reply from %s has a LOCATION elsewhere: %q", d.from, location))
 			continue
 		}
 		if st := res.Header.Get("ST"); strings.Contains(st, "InternetGatewayDevice") || wanConnection(st) {
@@ -224,24 +253,25 @@ func parseSSDP(devices []datagram) ([]http.Header, error) {
 	return headers, nil
 }
 
+func fromItself(location string, sender netip.Addr) bool {
+	u, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	host, err := netip.ParseAddr(u.Hostname())
+	return err == nil && host.Unmap() == sender.Unmap()
+}
+
 func wanConnection(s string) bool {
 	return strings.Contains(s, "WANIPConnection") || strings.Contains(s, "WANPPPConnection")
 }
 
-func deviceDescription(header http.Header) (root, error) {
+func deviceDescription(c context.Context, header http.Header) (root, error) {
 	r := root{}
 	location := header.Get("LOCATION")
-	res, err := httpClient.Get(location)
+	body, res, err := get(c, location)
 	if err != nil {
 		return r, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return r, fmt.Errorf("GET %s: %w", location, err)
-	}
-	if res.StatusCode != http.StatusOK {
-		return r, fmt.Errorf("GET %s: %s: %s", location, res.Status, snippet(body))
 	}
 	if err := decodeXML(body, &r); err != nil && len(r.Device.ServiceList) == 0 && len(r.Device.DeviceList) == 0 {
 		return r, fmt.Errorf("GET %s: not a device description: %w: %s", location, err, snippet(body))
@@ -252,22 +282,14 @@ func deviceDescription(header http.Header) (root, error) {
 	return r, nil
 }
 
-func serviceActions(s service) ([]string, error) {
+func serviceActions(c context.Context, s service) ([]string, error) {
 	url, err := resolveURL(s.Location, s.SCPDURL)
 	if err != nil {
 		return nil, err
 	}
-	res, err := httpClient.Get(url)
+	body, _, err := get(c, url)
 	if err != nil {
 		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s: %s", url, res.Status, snippet(body))
 	}
 	desc := description{}
 	if err := decodeXML(body, &desc); err != nil && len(desc.ActionList) == 0 {
@@ -286,12 +308,20 @@ func serviceActions(s service) ([]string, error) {
 	return actions, nil
 }
 
-func getConnectionService(location string, rootDevice device) ([]service, error) {
+func getConnectionService(c context.Context, location string, rootDevice device) ([]service, error) {
 	services := []service{}
 	errs := []error{}
 	for _, s := range rootDevice.ServiceList {
+		if err := c.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if !sameHost(location, s.ControlURL) || !sameHost(location, s.SCPDURL) {
+			errs = append(errs, fmt.Errorf("%s points away from %s: %q, %q", s.ServiceType, location, s.ControlURL, s.SCPDURL))
+			continue
+		}
 		s.Location = location
-		actions, err := serviceActions(s)
+		actions, err := serviceActions(c, s)
 		keep := err == nil || wanConnection(s.ServiceType)
 		debug("service", "base", location, "type", s.ServiceType, "control", s.ControlURL, "scpd", s.SCPDURL,
 			"actions", actions, "candidate", keep, "err", err)
@@ -305,7 +335,7 @@ func getConnectionService(location string, rootDevice device) ([]service, error)
 		services = append(services, s)
 	}
 	for _, d := range rootDevice.DeviceList {
-		s, err := getConnectionService(location, d)
+		s, err := getConnectionService(c, location, d)
 		services = append(services, s...)
 		errs = append(errs, err)
 	}
@@ -345,7 +375,7 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 	msg.XMLNS = c.service.ServiceType
 	retried := false
 	for {
-		req, err := newEnvelopeReq(addPortMapping, c.service, &msg)
+		req, err := newEnvelopeReq(context.Background(), addPortMapping, c.service, &msg)
 		if err != nil {
 			return AddPortMappingResponse{}, c.fail(mapping(msg, retried), err)
 		}
@@ -373,10 +403,13 @@ func (c *Client) AddPortMapping(msg AddPortMappingRequest) (AddPortMappingRespon
 }
 
 func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMappingResponse, error) {
+	if msg.NewExternalPort == 0 {
+		return DeletePortMappingResponse{}, errors.New("DeletePortMapping: NewExternalPort is required")
+	}
 	msg.NewProtocol = strings.ToUpper(msg.NewProtocol)
 	msg.XMLNS = c.service.ServiceType
 	what := fmt.Sprintf("unmap %s %d", msg.NewProtocol, msg.NewExternalPort)
-	req, err := newEnvelopeReq(deletePortMapping, c.service, &msg)
+	req, err := newEnvelopeReq(context.Background(), deletePortMapping, c.service, &msg)
 	if err != nil {
 		return DeletePortMappingResponse{}, c.fail(what, err)
 	}
@@ -392,10 +425,14 @@ func (c *Client) DeletePortMapping(msg DeletePortMappingRequest) (DeletePortMapp
 }
 
 func (c *Client) GetExternalIPAddress() (GetExternalIPAddressResponse, error) {
+	return c.externalIP(context.Background())
+}
+
+func (c *Client) externalIP(ctx context.Context) (GetExternalIPAddressResponse, error) {
 	msg := GetExternalIPAddressRequest{
 		XMLNS: c.service.ServiceType,
 	}
-	req, err := newEnvelopeReq(getExternalIPAddress, c.service, &msg)
+	req, err := newEnvelopeReq(ctx, getExternalIPAddress, c.service, &msg)
 	if err != nil {
 		return GetExternalIPAddressResponse{}, c.fail("get external ip", err)
 	}
