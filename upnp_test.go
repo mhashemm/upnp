@@ -934,3 +934,27 @@ func TestLogging(t *testing.T) {
 		}
 	}
 }
+
+// A gateway behind carrier NAT maps ports fine and reports an address nobody
+// outside can reach, so the caller has to be able to tell.
+func TestIPClass(t *testing.T) {
+	for ip, want := range map[string]string{
+		"88.1.2.3":       IPPublic,
+		" 88.1.2.3\n":    IPPublic,
+		"2001:4860::1":   IPPublic,
+		"10.172.178.175": IPPrivate,
+		"192.168.1.1":    IPPrivate,
+		"172.16.0.1":     IPPrivate,
+		"100.64.0.1":     IPPrivate,
+		"fd00::1":        IPPrivate,
+		"0.0.0.0":        IPUnusable,
+		"":               IPUnusable,
+		"not an ip":      IPUnusable,
+		"127.0.0.1":      IPUnusable,
+		"169.254.1.1":    IPUnusable,
+	} {
+		if got := IPClass(ip); got != want {
+			t.Errorf("IPClass(%q) = %q, want %q", ip, got, want)
+		}
+	}
+}
