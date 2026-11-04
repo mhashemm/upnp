@@ -4,25 +4,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`github.com/mhashemm/upnp` — a zero-dependency Go library (stdlib only, Go 1.23.3) that opens/closes router port mappings via UPnP IGD. Three public operations: `AddPortMapping`, `DeletePortMapping`, `GetExternalIPAddress`.
+`github.com/mhashemm/upnp` — a zero-dependency Go library (stdlib only, Go 1.23.3) that opens/closes router port mappings via UPnP IGD. Three public operations: `AddPortMapping`, `DeletePortMapping`, `GetExternalIPAddress`, after `NewContext` (or `New`) finds the gateway. `IPClass` says what an address is good for.
 
 ## Commands
 
 ```bash
 go build ./...
 go vet ./...
-go test ./...         # full suite, offline
-go run ./playground   # manual smoke test — needs a real UPnP router on the LAN
+go test -race ./...   # full suite, offline, well under a second
+go test -race -count=30 -cpu=1,4,16 ./...   # stress a changed test before trusting it
 
-# verify against the real router with access to unexported state:
-# write a throwaway zz_live_test.go in package upnp, `go test -run Live -v`, then rm it.
-# playground/ is package main and cannot reach c.service.
+# verify against the real router: write a throwaway zz_live_test.go in package upnp,
+# `go test -run Live -v`, then rm it. NewContext and GetExternalIPAddress change nothing
+# on the router; only a call to AddPortMapping does. playground/ is gitignored, local only.
 ```
 
-`upnp_test.go` covers the package: URL resolution, the M-SEARCH bytes and search targets, SSDP parsing, dedupe and gateway-first ordering, UDP retransmission, the proxy-free transport, XML tolerance (latin-1 included), SCPD action discovery and the WAN fallback, service ranking and live-WAN selection (public before private), the SOAP envelope's namespace prefixes and headers, fault decoding (in a 200 too), the 725 retry and its reported lease, the request defaults, the three client operations, the context every error carries, and the log trace. It runs offline — `httptest` fake routers plus a loopback UDP responder — except `TestGetLocalIPAddr`, which skips without a route. `New` and `discover` are the only uncovered functions: both need real multicast, so they stay on the manual `playground/` path (gitignored, not part of the module's public surface). `go test -short` skips the one test that waits out the 6.5s SSDP deadline.
+`upnp_test.go` covers the package: URL resolution, the M-SEARCH bytes and search targets, SSDP parsing, dedupe and gateway-first ordering, UDP retransmission, the proxy-free transport, XML tolerance (latin-1 included), SCPD action discovery and the WAN fallback, service ranking and live-WAN selection (public before private), the SOAP envelope's namespace prefixes and headers, fault decoding (in a 200 too), the 725 retry and its reported lease, the request defaults, the three client operations, the context every error carries, and the log trace. It runs offline — `httptest` fake routers plus a loopback UDP responder — except `TestGetLocalIPAddr`, which skips without a route. `New`, `NewContext` and `discover` need real multicast, so they're covered by watchparty's e2e and the live test recipe above.
+
+CI (`.github/workflows/pr.yml`) runs vet and `go test -race` on Linux, Windows and macOS, on the `go.mod` version, plus gofmt. `github.com/mhashemm/watchparty` is the real user: its `e2e_lib.Gateway` drives this library over real SSDP and SOAP, so run its `make e2e E2E="--mode gui"` against a change here before tagging.
+
+## Security
+
+**Every byte off the LAN is hostile.** SSDP has no authentication, so any device can answer, and a caller may be a long-running app. These limits are load-bearing; don't simplify them away:
+
+- **Memory:** bodies stop at `maxBody`, replies at `maxReplies`, and each reply is copied down to its own size.
+- **Time:** `discoveryTimeout` bounds `NewContext`, and a cancelled context ends the SSDP wait and stops the walk. Every discovery HTTP call takes the context.
+- **A gateway speaks only for itself:** `LOCATION` must be the sender's own IP (`fromItself`), `controlURL` and `SCPDURL` must stay on that host (`sameHost`), a `URLBase` elsewhere is ignored, and a redirect off the host stops at its 3xx. Otherwise a device gets to send requests from the caller's machine to anything, loopback included.
+- **What a device says comes through as is.** It can claim to be the gateway and lie about its address; that's inherent to UPnP. Log values and errors can hold any text, so a caller that treats its log as lines has to clean them. `identity` collapses whitespace only because it reads better.
 
 ## Conventions
 
+- **Every test calls `t.Parallel()` and finishes in milliseconds.** A delay the code owns is an argument the test shortens (`udpRequest`'s `retryGap`, `wait`). Prove an absence with an ordering, or a counter on a server that must not be hit, not a timeout. The only serial test is `TestLogging`, for the `Logger` global.
+- **A behaviour change lands with its test, and the test must be proven:** reintroduce the bug, watch it fail, restore, watch it pass.
+- **Reasoning goes in the commit body:** the incident, the alternatives rejected, what was tested and what wasn't. Branch first, and merge with a normal merge. Never force-push.
 - **No comments in `upnp.go`/`utils.go`/`structs.go`.** The source is deliberately comment-free; explain things here instead. `upnp_test.go` is the exception — its comments record which router bug each test pins.
 - **Keep every type and field in `structs.go` that mirrors the UPnP XML or SOAP, even when nothing reads it** (`specVersion`, `argument`, `ServiceId`, `EventSubURL`, `SerialNumber`, `UDN`, the envelope's `XMLNS`/`EncodingStyle`, ...). They document the wire format, so the next feature starts from what is already there instead of from the specs.
 
@@ -32,7 +46,7 @@ Everything is one flat package (`upnp.go` logic, `utils.go` transport helpers, `
 
 1. **`GetLocalIPAddr`** — dials a UDP socket to a bogus address (`6.9.6.9:6969`) purely to make the kernel pick the outbound interface IP. Nothing is sent.
 2. **`discover`** — multicasts one literal SSDP `M-SEARCH` datagram per entry in `ssdpTargets` (built by `mSearch` in utils.go) to `239.255.255.250:1900`, then collects every reply, with its sender address (`datagram`), until one absolute deadline (`ssdpWait`, 6.5s) expires. Each datagram is a literal because `net/http` cannot serialize a non-HTTP method to `*`, and because building it from a map shuffled the header order from run to run. `parseSSDP` reads each reply with `http.ReadResponse`, dedupes by `LOCATION`, and moves gateways to the front (see `ssdpTargets` below).
-3. **`upnpService`** — for each replying device (deduped by `LOCATION`), GETs its device-description XML, then walks the nested `device`/`deviceList` tree (`getConnectionService`, recursive) and probes each service's `SCPDURL`. A service qualifies if its action list contains one of the three supported actions (`serviceActions`), or if it is a `WANIPConnection`/`WANPPPConnection` whose SCPD could not be used. `getConnectionService` returns *every* qualifying service; `connectedService` then picks the one whose `GetExternalIPAddress` answers with a usable address, preferring a public one over a private or CGN (`100.64.0.0/10`) one. Routers list both `WANIPConnection` and `WANPPPConnection` with only one live, and ISP routers add management or VoIP connections with private addresses beside the internet one; Tailscale ranks the same way (tailscale/tailscale#8364). First qualifying service is the fallback when none look connected. Failures accumulate into an `errors.Join`. A device that yields no candidate and no error adds an error of its own: `errors.Join` of only nils is `nil`, and `New` would otherwise return a client with no service.
+3. **`upnpService`** — for each replying device (deduped by `LOCATION`), GETs its device-description XML, then walks the nested `device`/`deviceList` tree (`getConnectionService`, recursive) and probes each service's `SCPDURL`. A service qualifies if its action list contains one of the three supported actions (`serviceActions`), or if it is a `WANIPConnection`/`WANPPPConnection` whose SCPD could not be used. `getConnectionService` returns *every* qualifying service; `connectedService` then picks the one whose `GetExternalIPAddress` answers with a usable address, preferring a public one over a private or CGN (`100.64.0.0/10`) one. Routers list both `WANIPConnection` and `WANPPPConnection` with only one live, and ISP routers add management or VoIP connections with private addresses beside the internet one; Tailscale ranks the same way (tailscale/tailscale#8364). `upnpService` keeps looking past a device with only a private address, since a mesh node or second router may answer before the real one. First qualifying service is the fallback when none look connected. Failures accumulate into an `errors.Join`. A device that yields no candidate and no error adds an error of its own: `errors.Join` of only nils is `nil`, and `New` would otherwise return a client with no service.
 4. Everything after discovery is SOAP over HTTP: `newEnvelopeReq` marshals the request struct into a literal envelope and sets the `SOAPAction` header, `doRequest` decodes the reply with `decodeXML`.
 
 Consequences worth knowing before changing things:
@@ -47,7 +61,7 @@ Consequences worth knowing before changing things:
 
 - **`AddPortMapping` fills in zero values before sending**, so a zero field never asks for something dangerous or useless:
   - `NewExternalPort` 0 becomes `NewInternalPort`, and if both are 0 the call fails without sending. Port 0 is a wildcard that older miniupnpd routers honoured by forwarding every external port (Tailscale advisory TS-2023-006).
-  - `NewLeaseDuration` 0 becomes 3600: 0 is permanent on IGDv1, and the wiki in `readme` recommends 3600.
+  - `NewLeaseDuration` 0 becomes 3600: 0 is permanent on IGDv1, and the wiki in `README.md` recommends 3600.
   - `NewEnabled` 0 becomes 1: 0 asks for a disabled mapping, which a stack that honours it accepts with a 200 and never forwards (miniupnpd ignores it).
   - `NewInternalClient` "" becomes `LocalIP`.
 
@@ -101,4 +115,4 @@ upnp.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level
 
 ## Reference
 
-Protocol background in `readme`: <https://github.com/Self-Hosting-Group/wiki/wiki/Port-Mapping-Protocols-Overview> and RFC 6887 (PCP).
+Protocol background in `README.md`: <https://github.com/Self-Hosting-Group/wiki/wiki/Port-Mapping-Protocols-Overview> and RFC 6887 (PCP).
