@@ -114,7 +114,7 @@ func (s service) String() string {
 	}
 	wan := ""
 	if s.ExternalIP != "" {
-		wan = "external ip " + strings.TrimSpace(s.ExternalIP) + " " + ipClass(s.ExternalIP)
+		wan = "external ip " + strings.TrimSpace(s.ExternalIP) + " " + IPClass(s.ExternalIP)
 	}
 	gateway := control + note(s.ServiceType, wan)
 	if s.Device != "" {
@@ -125,20 +125,26 @@ func (s service) String() string {
 
 func selected(s service) {
 	info("gateway selected", "device", s.Device, "base", s.Location, "service", s.ServiceType, "control", s.ControlURL,
-		"external_ip", s.ExternalIP, "class", ipClass(s.ExternalIP))
+		"external_ip", s.ExternalIP, "class", IPClass(s.ExternalIP))
 }
 
 var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
 
-func ipClass(s string) string {
+const (
+	IPPublic   = "public"
+	IPPrivate  = "private"
+	IPUnusable = "unusable"
+)
+
+func IPClass(s string) string {
 	ip, err := netip.ParseAddr(strings.TrimSpace(s))
 	switch {
 	case err != nil || !ip.IsGlobalUnicast():
-		return "unusable"
+		return IPUnusable
 	case ip.IsPrivate() || sharedAddressSpace.Contains(ip):
-		return "private"
+		return IPPrivate
 	}
-	return "public"
+	return IPPublic
 }
 
 func connectedService(candidates []service) (service, bool) {
@@ -147,12 +153,12 @@ func connectedService(candidates []service) (service, bool) {
 		s := &candidates[i]
 		res, err := (&Client{service: *s}).GetExternalIPAddress()
 		s.ExternalIP = res.NewExternalIPAddress
-		class := ipClass(s.ExternalIP)
+		class := IPClass(s.ExternalIP)
 		debug("wan probe", "service", s.ServiceType, "control", s.ControlURL, "external_ip", s.ExternalIP, "class", class, "err", err)
-		if class == "public" {
+		if class == IPPublic {
 			return *s, true
 		}
-		if class == "private" {
+		if class == IPPrivate {
 			private = append(private, *s)
 		}
 	}

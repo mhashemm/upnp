@@ -89,6 +89,8 @@ To capture a run (e.g. in `playground/`):
 upnp.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 ```
 
+**`IPClass`** says what an address is good for: `IPPublic`, `IPPrivate` (RFC 1918, ULA, or carrier NAT's `100.64.0.0/10`) or `IPUnusable`. A mapping succeeds behind carrier NAT and `GetExternalIPAddress` then returns a private address nobody outside can reach, so a caller that shares that address needs this.
+
 **Errors stand alone,** because a caller may never turn the logger on.
 - **`Client` calls** fail as `<request> on <gateway>: <Action>: <cause>`, built by `Client.fail`, `mapping` and `service.String`. Example: `map TCP 8080 -> 192.168.1.5:8080, lease 3600s on TP-Link Archer C6 at http://192.168.1.1:1900/ctl (urn:...:WANIPConnection:1, external ip 100.71.2.3 private): AddPortMapping: upnp error 718: ConflictInMappingEntry`.
   - The request says `after upnp error 725` when the lease-0 retry happened.
